@@ -596,8 +596,15 @@ else:
 
 st.markdown("**Realisasi Bulanan per Jenis Belanja**")
 
-BARIS_TOTAL_REALISASI_RP = "Total Realisasi (Rp)"
-BARIS_TOTAL_REALISASI_PCT = "Total Realisasi (%)"
+# Tanggal "sd." di judul baris total realisasi disamakan dengan tanggal update file data
+# (lihat tanggal_update_data() di atas) -- ambil bagian tanggalnya saja, tanpa jam.
+_tgl_update_lengkap = tanggal_update_data()
+_tgl_saja = _tgl_update_lengkap.split(",")[0].strip() if "," in _tgl_update_lengkap else _tgl_update_lengkap
+
+BARIS_TOTAL_REALISASI_RP = f"Total Realisasi (Rp) sd. tanggal {_tgl_saja}"
+BARIS_TOTAL_REALISASI_PCT = f"Total Realisasi (%) sd. tanggal {_tgl_saja}"
+BARIS_SISA_PAGU = "Sisa Pagu"
+BARIS_BLOKIR = "Blokir"
 BARIS_TOTAL_PROYEKSI_RP = "Total Realisasi + Proyeksi Akhir Tahun (Rp)"
 BARIS_TOTAL_PROYEKSI_PCT = "Total Realisasi + Proyeksi Akhir Tahun (%)"
 
@@ -682,6 +689,15 @@ total_real_pct = (realisasi_aktual_jenis.sum(axis=1) / pagu_aman * 100).fillna(0
 total_real_pct["TOTAL"] = (total_real_rp["TOTAL"] / pagu_total * 100) if pagu_total else 0
 total_real_pct.name = BARIS_TOTAL_REALISASI_PCT
 
+# Sisa Pagu = Pagu - realisasi AKTUAL (bukan realisasi+proyeksi), per jenis belanja.
+sisa_pagu_row = (pagu_per_jenis.reindex(urutan_kode) - realisasi_aktual_jenis.sum(axis=1))
+sisa_pagu_row["TOTAL"] = pagu_total - total_real_rp["TOTAL"]
+sisa_pagu_row.name = BARIS_SISA_PAGU
+
+blokir_row = df_satker.groupby("LABEL_JENIS_BELANJA")["BLOKIR"].sum().reindex(urutan_kode).fillna(0)
+blokir_row["TOTAL"] = df_satker["BLOKIR"].sum()
+blokir_row.name = BARIS_BLOKIR
+
 total_proyeksi_rp = tabel_tampil.reindex(urutan_kode).sum(axis=1)
 total_proyeksi_rp["TOTAL"] = total_proyeksi_rp.sum()
 total_proyeksi_rp.name = BARIS_TOTAL_PROYEKSI_RP
@@ -695,12 +711,16 @@ tabel_final = pd.concat([
     tabel_t,
     total_real_rp.to_frame().T,
     total_real_pct.to_frame().T,
+    sisa_pagu_row.to_frame().T,
+    blokir_row.to_frame().T,
     total_proyeksi_rp.to_frame().T,
     total_proyeksi_pct.to_frame().T,
 ])
 tabel_final = tabel_final.reindex(columns=urutan_kode + ["TOTAL"])
 
-BARIS_RUPIAH = ["PAGU"] + BULAN_KOLOM + [BARIS_TOTAL_REALISASI_RP, BARIS_TOTAL_PROYEKSI_RP]
+BARIS_RUPIAH = ["PAGU"] + BULAN_KOLOM + [
+    BARIS_TOTAL_REALISASI_RP, BARIS_SISA_PAGU, BARIS_BLOKIR, BARIS_TOTAL_PROYEKSI_RP,
+]
 BARIS_PERSEN = [BARIS_TOTAL_REALISASI_PCT, BARIS_TOTAL_PROYEKSI_PCT]
 
 # Baris bulan yang proyeksi (belum berakhir) ditandai kuning; begitu juga baris ringkasan
