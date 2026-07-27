@@ -20,7 +20,7 @@ from groq import Groq
 # --------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Dashboard Anggaran Terpadu",
+    page_title="Dashboard Anggaran dan Transfer Riau Terkini",
     page_icon="📊",
     layout="wide",
 )
@@ -38,12 +38,12 @@ LABEL_JENIS_BELANJA_SINGKAT = {
     56: "Belanja Hibah",
     57: "Belanja Bansos",
     58: "Belanja Lain-lain",
-    61: "TKD DBH",
-    62: "TKD DAU",
-    63: "TKD DAK Fisik",
-    64: "TKD Insentif Fiskal",
-    65: "TKD DAK Nonfisik",
-    66: "TKD Dana Desa",
+    61: "DBH",
+    62: "DAU",
+    63: "DAK Fisik",
+    64: "Insentif Daerah",
+    65: "DAK Nonfisik",
+    66: "Dana Desa",
 }
 
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -120,6 +120,18 @@ def siapkan_data(df_mentah: pd.DataFrame) -> pd.DataFrame:
     d["SISA PAGU"] = d["PAGU"] - d["REALISASI"]
     if "JENIS BELANJA" in d.columns:
         d["LABEL_JENIS_BELANJA"] = d["JENIS BELANJA"].map(LABEL_JENIS_BELANJA_SINGKAT).fillna(d.get("LABEL_JENIS_BELANJA", d["JENIS BELANJA"]))
+        
+        # Kategori Level 1 untuk Pie Chart Interaktif
+        jb_str = d["JENIS BELANJA"].astype(str)
+        d["KELOMPOK_BELANJA"] = np.where(jb_str.str.startswith("5"), "Belanja KL", 
+                                np.where(jb_str.str.startswith("6"), "Belanja TKD", "Lainnya"))
+
+    # Mengambil Nama Pemda (Kolom K / Index 10) sesuai instruksi
+    if len(df_mentah.columns) > 10:
+        d["NAMA_PEMDA"] = df_mentah.iloc[:, 10].astype(str)
+    else:
+        d["NAMA_PEMDA"] = "Tidak Diketahui"
+
     kolom_ada = [c for c in KOLOM_TEKS_CARI if c in d.columns]
     d["_TEKS_CARI"] = d[kolom_ada].fillna("").astype(str).agg(" ".join, axis=1).str.lower() if kolom_ada else ""
     return d
@@ -220,12 +232,47 @@ def get_groq_client():
     if not api_key: return None
     return Groq(api_key=api_key)
 
+def render_ai_chat(page_id: str, context_data: str):
+    st.divider()
+    st.subheader("🤖 Dialog Asisten AI")
+    st.caption("Tanyakan insight atau analisis terkait data pada halaman ini.")
+    
+    chat_key = f"chat_history_{page_id}"
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+        
+    for msg in st.session_state[chat_key]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            
+    user_input = st.chat_input(f"Tanya AI untuk {page_id}...")
+    if user_input:
+        st.session_state[chat_key].append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+            
+        client = get_groq_client()
+        if client:
+            with st.chat_message("assistant"):
+                with st.spinner("Menganalisis..."):
+                    try:
+                        sys_prompt = f"Anda adalah asisten cerdas penganalisis dashboard anggaran. Jawab dengan ringkas dan analitis. Konteks data: {context_data}"
+                        messages = [{"role": "system", "content": sys_prompt}] + st.session_state[chat_key][-4:]
+                        resp = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+                        ans = resp.choices[0].message.content
+                        st.markdown(ans)
+                        st.session_state[chat_key].append({"role": "assistant", "content": ans})
+                    except Exception as e:
+                        st.error(f"Error memanggil AI: {e}")
+        else:
+            st.warning("API Key Groq tidak ditemukan di environment/secrets.")
+
 # --------------------------------------------------------------------------
 # HALAMAN 1: Dashboard Pagu & Realisasi Satker (Original)
 # --------------------------------------------------------------------------
 
 def page_dashboard_utama():
-    st.title("📊 Dashboard Pagu & Realisasi Satker")
+    st.title("📊 Dashboard Anggaran dan Transfer Riau Terkini")
     st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data()}")
 
     if df.empty:
@@ -286,12 +333,24 @@ def page_dashboard_utama():
 
     st.caption(f"**{nmdept}** — **{nmsatker}** — Tahun {tahun}")
 
-    # -- Agregasi (dari kode asli) --
-    pagu_total = df_satker["PAGU"].sum()
-    realisasi_total = df_satker["REALISASI"].sum()
-    sisa_pagu = df_satker["SISA PAGU"].sum()
+    # Inisialisasi state filter pie chart interaktif
+    if "filter_kategori_belanja" not in st.session_state:
+        st.session_state.filter_kategori_belanja = "Semua"
+        
+    filter_aktif = st.session_state.filter_kategori_belanja
+    
+    # Terapkan filter berdasarkan hasil klik Pie Chart ke dataset
+    if filter_aktif != "Semua":
+        df_satker_filtered = df_satker[df_satker["KELOMPOK_BELANJA"] == filter_aktif]
+    else:
+        df_satker_filtered = df_satker.copy()
+
+    # -- Agregasi (menggunakan data yang sudah disaring via session state) --
+    pagu_total = df_satker_filtered["PAGU"].sum()
+    realisasi_total = df_satker_filtered["REALISASI"].sum()
+    sisa_pagu = df_satker_filtered["SISA PAGU"].sum()
     persen_serapan = (realisasi_total / pagu_total * 100) if pagu_total else 0
-    monthly = df_satker[BULAN_KOLOM].sum()
+    monthly = df_satker_filtered[BULAN_KOLOM].sum()
     kumulatif = monthly.cumsum()
 
     bulan_terisi = [i + 1 for i, v in enumerate(monthly.values) if v != 0]
@@ -354,31 +413,59 @@ def page_dashboard_utama():
         fig_pie1 = px.pie(names=["Realisasi", "Sisa Pagu"], values=[realisasi_total, max(sisa_pagu, 0)], hole=0.4)
         st.plotly_chart(fig_pie1, use_container_width=True)
 
-    # (Grafik Trend Line disingkat untuk fokus multi-page, tapi fungsionalitas inti tetap ada)
-    st.subheader("Komposisi Belanja")
-    if not jenis_belanja.empty:
-        fig_pie2 = px.pie(jenis_belanja, names="LABEL_JENIS_BELANJA", values="REALISASI", hole=0.4)
-        st.plotly_chart(fig_pie2, use_container_width=True)
-
-    # -- AI Chat Area --
-    st.divider()
-    st.subheader("🤖 Analisis & Chat AI")
-    client = get_groq_client()
+    st.subheader(f"Komposisi Belanja {'' if filter_aktif == 'Semua' else f'- {filter_aktif}'}")
+    st.caption("💡 Klik pada bagian chart untuk melihat rincian detail (drilldown), serta menyaring grafik & KPI di halaman ini.")
     
-    if client:
-        if st.button("Buat Ringkasan Otomatis"):
-            with st.spinner("Menyusun ringkasan..."):
-                ringkasan = f"Satker: {nmsatker} ({tahun}). Pagu: {pagu_total}. Realisasi: {realisasi_total} ({persen_serapan:.1f}%)."
-                resp = client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[
-                        {"role": "system", "content": "Buat paragraf naratif singkat dari data anggaran berikut."},
-                        {"role": "user", "content": ringkasan}
-                    ]
-                )
-                st.success(resp.choices[0].message.content)
+    if filter_aktif != "Semua":
+        if st.button("⬅️ Kembali Tampilkan Semua Belanja"):
+            st.session_state.filter_kategori_belanja = "Semua"
+            st.rerun()
+
+    # Tentukan Level Data Pie Chart
+    if filter_aktif == "Semua":
+        # Level 1: Belanja KL vs Belanja TKD
+        dist_belanja = df_satker.groupby("KELOMPOK_BELANJA")["REALISASI"].sum().reset_index()
+        
+        # Filter hanya tampilkan Belanja KL dan Belanja TKD (sesuai instruksi)
+        dist_belanja = dist_belanja[dist_belanja["KELOMPOK_BELANJA"].isin(["Belanja KL", "Belanja TKD"])]
+        
+        fig_pie2 = px.pie(dist_belanja, names="KELOMPOK_BELANJA", values="REALISASI", hole=0.4, 
+                          color="KELOMPOK_BELANJA", color_discrete_map={"Belanja KL": "#3b82f6", "Belanja TKD": "#10b981"})
     else:
-        st.info("Fitur AI nonaktif. Konfigurasi GROQ_API_KEY di secrets.")
+        # Level 2: Detail per Jenis Belanja (Pegawai, Barang, Modal, Bansos / DBH, DAU, dll)
+        dist_belanja = df_satker_filtered.groupby("LABEL_JENIS_BELANJA")["REALISASI"].sum().reset_index()
+        fig_pie2 = px.pie(dist_belanja, names="LABEL_JENIS_BELANJA", values="REALISASI", hole=0.4)
+
+    try:
+        # Menggunakan fitur on_select interaktif Streamlit (v1.35+)
+        event = st.plotly_chart(fig_pie2, use_container_width=True, on_select="rerun", key="pie_chart_h1")
+        
+        pts = []
+        if isinstance(event, dict):
+            pts = event.get("selection", {}).get("points", [])
+        elif hasattr(event, "selection"):
+            pts = getattr(event, "selection", {}).get("points", [])
+            
+        if pts:
+            clicked_label = pts[0].get("label", pts[0].get("x"))
+            
+            # Jika di Level 1 dan mengklik KL/TKD, terapkan filter state dan rerun aplikasinya
+            if filter_aktif == "Semua" and clicked_label in ["Belanja KL", "Belanja TKD"]:
+                st.session_state.filter_kategori_belanja = clicked_label
+                st.rerun()
+    except Exception:
+        # Fallback manual jika versi Streamlit pengguna masih lama
+        st.plotly_chart(fig_pie2, use_container_width=True)
+        st.info("Pilih kategori di bawah untuk memfilter data:")
+        fallback_choice = st.radio("Kategori Belanja:", ["Semua", "Belanja KL", "Belanja TKD"], 
+                                   index=["Semua", "Belanja KL", "Belanja TKD"].index(filter_aktif), horizontal=True)
+        if fallback_choice != filter_aktif:
+            st.session_state.filter_kategori_belanja = fallback_choice
+            st.rerun()
+
+    # -- AI Chat Area (Menggunakan komponen reusable) --
+    context_h1 = f"Satker: {nmsatker} ({tahun}). Pagu (berdasar filter {filter_aktif}): {pagu_total:,.0f}. Realisasi: {realisasi_total:,.0f} ({persen_serapan:.1f}%)."
+    render_ai_chat("halaman1_utama", context_h1)
 
 
 # --------------------------------------------------------------------------
@@ -445,6 +532,10 @@ def page_program_prioritas():
         tabel_tampil["% Serapan"] = (tabel_tampil["REALISASI"] / tabel_tampil["PAGU"] * 100).round(2)
         st.dataframe(tabel_tampil, use_container_width=True, hide_index=True)
 
+    # Tambahan Chat Box AI untuk Halaman 2
+    context_h2 = f"Total Pagu Program: {total_pagu}. Realisasi: {total_realisasi} ({persentase:.1f}%). Jumlah Program Prioritas: {len(df_filtered)}."
+    render_ai_chat("halaman2_prioritas", context_h2)
+
 
 # --------------------------------------------------------------------------
 # HALAMAN 3: Dashboard Dana Transfer ke Daerah (TKD)
@@ -458,8 +549,8 @@ def page_tkd():
         st.warning("Data belum tersedia.")
         return
         
-    # Daftar Jenis Belanja yang termasuk TKD
-    tkd_labels = ["TKD DBH", "TKD DAU", "TKD DAK Fisik", "TKD Insentif Fiskal", "TKD DAK Nonfisik", "TKD Dana Desa"]
+    # Daftar Jenis Belanja yang termasuk TKD (diperbarui)
+    tkd_labels = ["DBH", "DAU", "DAK Fisik", "Insentif Daerah", "DAK Nonfisik", "Dana Desa"]
     
     # Filter global df untuk TKD
     if "LABEL_JENIS_BELANJA" in df.columns:
@@ -515,6 +606,28 @@ def page_tkd():
         fig_line = px.line(df_monthly, x="Bulan", y="Penyaluran", markers=True)
         fig_line.update_traces(line_color="#059669", line_width=3)
         st.plotly_chart(fig_line, use_container_width=True)
+
+    st.divider()
+    st.subheader("Pembagian TKD Berdasarkan Nama Pemda")
+    if "NAMA_PEMDA" in df_filtered.columns:
+        df_pemda = df_filtered.groupby("NAMA_PEMDA").agg(
+            Alokasi_TKD=("PAGU", "sum"),
+            Realisasi_TKD=("REALISASI", "sum")
+        ).reset_index()
+        df_pemda["% Serapan"] = (df_pemda["Realisasi_TKD"] / df_pemda["Alokasi_TKD"] * 100).fillna(0).round(2)
+        df_pemda = df_pemda.sort_values(by="Alokasi_TKD", ascending=False)
+        
+        st.dataframe(df_pemda.style.format({
+            "Alokasi_TKD": "Rp {:,.0f}",
+            "Realisasi_TKD": "Rp {:,.0f}",
+            "% Serapan": "{:.2f}%"
+        }), use_container_width=True, hide_index=True)
+    else:
+        st.info("Informasi Nama Pemda tidak tersedia pada dataset.")
+
+    # Tambahan Chat Box AI untuk Halaman 3
+    context_h3 = f"Total Alokasi TKD: {total_pagu_tkd}. Tersalurkan: {total_real_tkd} ({persen_tkd:.1f}%)."
+    render_ai_chat("halaman3_tkd", context_h3)
 
 
 # --------------------------------------------------------------------------
