@@ -1,224 +1,36 @@
 """
-Dashboard Pagu & Realisasi Satker
-----------------------------------
+Halaman 1: Dashboard Pagu & Realisasi Satker
+----------------------------------------------
 Streamlit + Groq (narasi & chat AI). Supabase opsional untuk sumber data terpusat
 (lihat README.md, bagian "Pakai Supabase sebagai sumber data").
-"""
 
-import os
-from datetime import date
+Kode yang dipakai bersama halaman lain (loading data, login, proyeksi, dst) ada di
+common.py -- lihat file itu untuk detail implementasinya.
+"""
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from groq import Groq
 
-# --------------------------------------------------------------------------
-# Konfigurasi dasar
-# --------------------------------------------------------------------------
+from common import (
+    BULAN_KOLOM, BULAN_LABEL, GROQ_MODEL, fmt_satker, fmt_dept,
+    get_data, tanggal_update_data, require_login, get_groq_client, kpi_card,
+    hitung_proyeksi_agregat, hitung_proyeksi_per_kategori, isi_tabel_proyeksi,
+    hitung_bulan_penuh_terakhir,
+)
 
 st.set_page_config(
-    page_title="Dashboard Pagu & Realisasi Satker",
+    page_title="DATUK - Dashboard Pagu & Realisasi Satker",
     page_icon="📊",
     layout="wide",
 )
 
-BULAN_KOLOM = ["JAN", "FEB", "MAR", "APR", "MEI", "JUN",
-               "JUL", "AGS", "SEP", "OKT", "NOV", "DES"]
-BULAN_LABEL = {i + 1: b for i, b in enumerate(BULAN_KOLOM)}
+df = get_data()
 
-# Label jenis belanja versi singkat -- menggantikan label panjang bawaan data sumber, dipakai
-# konsisten di seluruh dashboard (tabel per jenis belanja, pie chart komposisi, dst).
-LABEL_JENIS_BELANJA_SINGKAT = {
-    51: "Belanja Pegawai",
-    52: "Belanja Barang",
-    53: "Belanja Modal",
-    54: "Belanja Bunga Utang",
-    55: "Belanja Subsidi",
-    56: "Belanja Hibah",
-    57: "Belanja Bansos",
-    58: "Belanja Lain-lain",
-    61: "TKD DBH",
-    62: "TKD DAU",
-    63: "TKD DAK Fisik",
-    64: "TKD Insentif Fiskal",
-    65: "TKD DAK Nonfisik",
-    66: "TKD Dana Desa",
-}
-
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-
-
-# --------------------------------------------------------------------------
-# Load data
-# --------------------------------------------------------------------------
-
-@st.cache_data(show_spinner="Memuat data...")
-def load_data_from_csv(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
-@st.cache_data(show_spinner="Memuat data dari Supabase...")
-def load_data_from_supabase(url: str, key: str, table: str) -> pd.DataFrame:
-    from supabase import create_client
-
-    client = create_client(url, key)
-    all_rows, page, page_size = [], 0, 1000
-    while True:
-        resp = (
-            client.table(table)
-            .select("*")
-            .range(page * page_size, (page + 1) * page_size - 1)
-            .execute()
-        )
-        rows = resp.data
-        all_rows.extend(rows)
-        if len(rows) < page_size:
-            break
-        page += 1
-    return pd.DataFrame(all_rows)
-
-
-def load_data() -> pd.DataFrame:
-    use_supabase = st.secrets.get("USE_SUPABASE", "false") == "true" if hasattr(st, "secrets") else False
-    if use_supabase:
-        return load_data_from_supabase(
-            st.secrets["SUPABASE_URL"],
-            st.secrets["SUPABASE_KEY"],
-            st.secrets.get("SUPABASE_TABLE", "pagu_realisasi"),
-        )
-    return load_data_from_csv("data/pagu_realisasi.csv.gz")
-
-
-@st.cache_data(show_spinner=False)
-def tanggal_update_data(path_csv: str = "data/pagu_realisasi.csv.gz") -> str:
-    """Tanggal 'data terakhir diperbarui', diambil dari tanggal commit git terakhir yang
-    mengubah file data ini di GitHub (jadi otomatis sesuai kapan file di-push, bukan perlu
-    diisi manual). Kalau bukan repo git (mis. dijalankan lokal tanpa git, atau folder .git
-    tidak ikut ter-deploy), fallback ke waktu modifikasi file di disk."""
-    import subprocess
-    from datetime import datetime as _dt
-
-    nama_bulan = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
-                  "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
-
-    def _format(dt):
-        return f"{dt.day} {nama_bulan[dt.month - 1]} {dt.year}, {dt.strftime('%H:%M')}"
-
-    try:
-        hasil = subprocess.run(
-            ["git", "log", "-1", "--format=%cI", "--", path_csv],
-            capture_output=True, text=True, timeout=5,
-        )
-        tanggal_str = hasil.stdout.strip()
-        if tanggal_str:
-            return _format(_dt.fromisoformat(tanggal_str))
-    except Exception:
-        pass
-
-    try:
-        return _format(_dt.fromtimestamp(os.path.getmtime(path_csv))) + " (perkiraan)"
-    except Exception:
-        return "tidak diketahui"
-
-
-KOLOM_TEKS_CARI = [
-    "NMDEPT", "NMSATKER", "PROVINSI", "KABKOTA", "FUNGSI", "SUBFUNGSI",
-    "PROGRAM", "KEGIATAN", "OUTPUT", "AKUN",
-]
-
-
-@st.cache_data(show_spinner="Menyiapkan data...")
-def siapkan_data(df_mentah: pd.DataFrame) -> pd.DataFrame:
-    d = df_mentah.copy()
-    # REALISASI & SISA PAGU dihitung ulang dari total kolom bulanan (JAN..DES).
-    # Ini supaya semua angka di dashboard konsisten dengan rincian bulanannya -- pada
-    # sebagian data sumber, kolom REALISASI bawaan bisa tidak sinkron dengan JAN..DES-nya.
-    d["REALISASI"] = d[BULAN_KOLOM].sum(axis=1)
-    d["SISA PAGU"] = d["PAGU"] - d["REALISASI"]
-
-    # Ganti label jenis belanja dengan versi singkat (lihat LABEL_JENIS_BELANJA_SINGKAT).
-    # Kode yang tidak ada di mapping (mis. "Lainnya (XX)") tetap pakai label asli dari data sumber.
-    d["LABEL_JENIS_BELANJA"] = (
-        d["JENIS BELANJA"].map(LABEL_JENIS_BELANJA_SINGKAT).fillna(d["LABEL_JENIS_BELANJA"])
-    )
-
-    # Kolom teks gabungan (lowercase) untuk pencarian tematik AI (mis. "ketahanan pangan",
-    # "kebakaran hutan") -- dipakai fitur pencarian di chat box.
-    kolom_ada = [c for c in KOLOM_TEKS_CARI if c in d.columns]
-    if kolom_ada:
-        d["_TEKS_CARI"] = (
-            d[kolom_ada].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
-        )
-    else:
-        d["_TEKS_CARI"] = ""
-    return d
-
-
-df = siapkan_data(load_data())
-
-
-# --------------------------------------------------------------------------
-# Login
-# --------------------------------------------------------------------------
-# Username & password = kode satker masing-masing (contoh: satker kode 123456 login
-# dengan username "123456" & password "123456"). Ada satu super user (kanwil04/admin)
-# yang bisa melihat seluruh data semua satker.
-
-SUPERUSER_USERNAME = "kanwil04"
-SUPERUSER_PASSWORD = "admin"
-
-
-def _cek_login(username: str, password: str, df_all: pd.DataFrame):
-    username = (username or "").strip()
-    password = (password or "").strip()
-    if username == SUPERUSER_USERNAME and password == SUPERUSER_PASSWORD:
-        return {"role": "super", "kdsatker": None}
-    if username and username == password and username.isdigit():
-        kdsatker = int(username)
-        if kdsatker in df_all["KDSATKER"].unique():
-            return {"role": "satker", "kdsatker": kdsatker}
-    return None
-
-
-if "auth" not in st.session_state:
-    st.session_state.auth = None
-
-if st.session_state.auth is None:
-    st.title("🔐 Login Dashboard Pagu & Realisasi Satker")
-    st.caption(
-        "Login memakai kode satker Anda sebagai username maupun password. Setelah login, "
-        "Anda hanya bisa melihat data satker Anda sendiri."
-    )
-    with st.form("form_login"):
-        username_input = st.text_input("Username (kode satker)")
-        password_input = st.text_input("Password", type="password")
-        submit_login = st.form_submit_button("Login")
-    if submit_login:
-        hasil_login = _cek_login(username_input, password_input, df)
-        if hasil_login:
-            st.session_state.auth = hasil_login
-            st.rerun()
-        else:
-            st.error("Username atau password salah, atau kode satker tidak ditemukan di data.")
-    st.stop()
-
-auth = st.session_state.auth
+auth = require_login(df, judul_halaman="DATUK")
 is_super = auth["role"] == "super"
-
-with st.sidebar:
-    if is_super:
-        st.success(f"👤 Super User ({SUPERUSER_USERNAME})")
-    else:
-        st.success(f"👤 Satker: {auth['kdsatker']}")
-    if st.button("🚪 Logout"):
-        st.session_state.auth = None
-        st.rerun()
-
-# Dipakai fungsi cari_anggaran (chat AI) supaya pencarian tematik lintas-satker tetap dibatasi
-# hanya ke satker milik user yang login (None = super user, tidak dibatasi).
 SCOPE_KDSATKER = None if is_super else auth["kdsatker"]
 
 
@@ -242,7 +54,7 @@ if is_super:
         .drop_duplicates()
         .sort_values("KDDEPT")
     )
-    dept_options["LABEL"] = dept_options["KDDEPT"].astype(str) + " - " + dept_options["NMDEPT"]
+    dept_options["LABEL"] = dept_options["KDDEPT"].apply(fmt_dept) + " - " + dept_options["NMDEPT"]
     dept_label = st.sidebar.selectbox("Kementerian/Lembaga", [SEMUA_DEPT] + dept_options["LABEL"].tolist())
 
     if dept_label == SEMUA_DEPT:
@@ -259,7 +71,7 @@ if is_super:
         .drop_duplicates()
         .sort_values("KDSATKER")
     )
-    satker_options["LABEL"] = satker_options["KDSATKER"].astype(str) + " - " + satker_options["NMSATKER"]
+    satker_options["LABEL"] = satker_options["KDSATKER"].apply(fmt_satker) + " - " + satker_options["NMSATKER"]
     satker_label = st.sidebar.selectbox("Satuan Kerja (Satker)", [SEMUA_SATKER] + satker_options["LABEL"].tolist())
 
     if satker_label == SEMUA_SATKER:
@@ -277,7 +89,7 @@ else:
 
     tahun_list = sorted(df_kdsatker_semua_tahun["TAHUN"].unique(), reverse=True)
     if not tahun_list:
-        st.error(f"Tidak ada data untuk satker dengan kode {kdsatker}.")
+        st.error(f"Tidak ada data untuk satker dengan kode {fmt_satker(kdsatker)}.")
         st.stop()
     tahun = st.sidebar.selectbox("Tahun", tahun_list)
 
@@ -295,8 +107,8 @@ else:
         nmdept = df_satker["NMDEPT"].iloc[0]
         df_dept = df_tahun[df_tahun["KDDEPT"] == kddept]
 
-    st.sidebar.caption(f"Satker: **{kdsatker} - {nmsatker}**")
-    st.sidebar.caption(f"Kementerian/Lembaga: {nmdept}")
+    st.sidebar.caption(f"Satker: **{fmt_satker(kdsatker)} - {nmsatker}**")
+    st.sidebar.caption(f"Kementerian/Lembaga: {fmt_dept(kddept)} - {nmdept}")
 
 
 # --------------------------------------------------------------------------
@@ -311,22 +123,7 @@ persen_serapan = (realisasi_total / pagu_total * 100) if pagu_total else 0
 monthly = df_satker[BULAN_KOLOM].sum()
 kumulatif = monthly.cumsum()
 
-# bulan terakhir yang punya realisasi (>0) -- termasuk bulan berjalan yang baru terisi sebagian
-bulan_terisi = [i + 1 for i, v in enumerate(monthly.values) if v != 0]
-bulan_terakhir = max(bulan_terisi) if bulan_terisi else 0
-
-# Bulan terakhir yang datanya sudah PENUH (bulan kalender itu sudah benar-benar berakhir).
-# Beda dengan bulan_terakhir di atas: kalau tahun yang dipilih = tahun berjalan, bulan yang
-# sedang berjalan (mis. hari ini masih di tengah bulan itu) TIDAK dihitung "penuh" walaupun
-# sudah ada sebagian realisasi tercatat -- dipakai grafik tren & tabel per-bulan supaya bulan
-# yang belum berakhir ditampilkan sebagai proyeksi, bukan aktual.
-hari_ini = date.today()
-if tahun < hari_ini.year:
-    bulan_penuh_terakhir = bulan_terakhir
-elif tahun > hari_ini.year:
-    bulan_penuh_terakhir = 0
-else:
-    bulan_penuh_terakhir = min(bulan_terakhir, hari_ini.month - 1)
+bulan_terakhir, bulan_penuh_terakhir = hitung_bulan_penuh_terakhir(df_satker, tahun)
 
 jenis_belanja = (
     df_satker.groupby("LABEL_JENIS_BELANJA")["REALISASI"]
@@ -338,67 +135,12 @@ jenis_belanja = (
 
 # --------------------------------------------------------------------------
 # Proyeksi: rerata tertimbang tingkat realisasi 5 tahun sebelumnya x pagu tahun berjalan
-#
-#   proyeksi_bulan_m = pagu_tahun_ini * [ Σ bobot_i * (realisasi_bulan_m_tahun(y-i) / pagu_tahun(y-i)) ] / Σ bobot_i
-#
-# bobot: y-1=50%, y-2=25%, y-3=12,5%, y-4=6,25%, y-5=6,25%. Tahun yang datanya tidak ada di
-# sumber (mis. satker belum ada / pagu=0) dilewati, dan bobotnya dinormalisasi ulang di antara
-# tahun-tahun yang tersedia.
+# (lihat common.py::hitung_proyeksi_agregat utk rumus lengkap & penjelasan bobot)
 # --------------------------------------------------------------------------
 
-BOBOT_TAHUN = {1: 0.50, 2: 0.25, 3: 0.125, 4: 0.0625, 5: 0.0625}
+FILTER_ENTITAS = {"KDDEPT": kddept, "KDSATKER": kdsatker}
 
-
-def _filter_entitas(thn: int) -> pd.DataFrame:
-    d = df[df["TAHUN"] == thn]
-    if kddept is not None:
-        d = d[d["KDDEPT"] == kddept]
-    if kdsatker is not None:
-        d = d[d["KDSATKER"] == kdsatker]
-    return d
-
-
-def hitung_proyeksi_agregat(tahun_y: int, pagu_y: float):
-    """Proyeksi 12 bulan (rupiah) untuk seluruh satker/entitas terpilih. Return (array atau None, daftar tahun yang dipakai)."""
-    total_rate = np.zeros(12)
-    total_bobot = 0.0
-    tahun_dipakai = []
-    for i in range(1, 6):
-        d_prev = _filter_entitas(tahun_y - i)
-        pagu_prev = d_prev["PAGU"].sum() if not d_prev.empty else 0
-        if pagu_prev <= 0:
-            continue
-        monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
-        total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
-        total_bobot += BOBOT_TAHUN[i]
-        tahun_dipakai.append(tahun_y - i)
-    if total_bobot == 0:
-        return None, tahun_dipakai
-    return (total_rate / total_bobot) * pagu_y, tahun_dipakai
-
-
-def hitung_proyeksi_per_jenis(tahun_y: int, pagu_per_jenis_now: pd.Series):
-    """Proyeksi 12 bulan (rupiah) per jenis belanja. Return dict label -> array(12) atau None."""
-    hasil = {}
-    tahun_dipakai_semua = set()
-    for label, pagu_now in pagu_per_jenis_now.items():
-        total_rate = np.zeros(12)
-        total_bobot = 0.0
-        for i in range(1, 6):
-            d_prev = _filter_entitas(tahun_y - i)
-            d_prev = d_prev[d_prev["LABEL_JENIS_BELANJA"] == label]
-            pagu_prev = d_prev["PAGU"].sum() if not d_prev.empty else 0
-            if pagu_prev <= 0:
-                continue
-            monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
-            total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
-            total_bobot += BOBOT_TAHUN[i]
-            tahun_dipakai_semua.add(tahun_y - i)
-        hasil[label] = (total_rate / total_bobot) * pagu_now if total_bobot > 0 else None
-    return hasil, sorted(tahun_dipakai_semua, reverse=True)
-
-
-proyeksi_agregat_bulanan, tahun_dipakai = hitung_proyeksi_agregat(tahun, pagu_total)
+proyeksi_agregat_bulanan, tahun_dipakai = hitung_proyeksi_agregat(df, tahun, pagu_total, FILTER_ENTITAS)
 
 if proyeksi_agregat_bulanan is None:
     # Tidak ada histori sama sekali (mis. tahun pertama dalam data) -> fallback rata-rata bulan berjalan
@@ -406,9 +148,12 @@ if proyeksi_agregat_bulanan is None:
     proyeksi_akhir_tahun = rerata_bulanan * 12
     metode_proyeksi = "fallback"
 else:
-    proyeksi_akhir_tahun = realisasi_total + sum(
-        proyeksi_agregat_bulanan[m] for m in range(bulan_terakhir, 12)
-    )
+    # Target satu tahun penuh berdasarkan rerata tertimbang tingkat realisasi historis.
+    # Proyeksi akhir tahun = target itu, ATAU realisasi aktual sekarang kalau realisasi
+    # aktual sudah melebihi target itu sendiri (tidak mungkin proyeksi akhir tahun lebih
+    # kecil dari yang sudah benar-benar terealisasi).
+    target_tahun_penuh = proyeksi_agregat_bulanan.sum()
+    proyeksi_akhir_tahun = max(realisasi_total, target_tahun_penuh)
     metode_proyeksi = "historis"
 
 persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
@@ -421,26 +166,6 @@ persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
 st.title("📊 Dashboard Pagu & Realisasi Satker")
 st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data()}")
 st.caption(f"{nmdept} — {nmsatker} — Tahun {tahun}")
-
-
-def kpi_card(label: str, value: str, delta: str = None):
-    delta_html = (
-        f'<div style="font-size:0.85rem;color:#16a34a;margin-top:4px;">{delta}</div>'
-        if delta else ""
-    )
-    st.markdown(
-        f"""
-        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;
-                    padding:16px 18px;min-height:110px;">
-            <div style="font-size:0.85rem;color:#64748b;margin-bottom:6px;">{label}</div>
-            <div style="font-size:clamp(1rem, 2.1vw, 1.6rem);font-weight:700;color:#0f172a;
-                        white-space:normal;overflow-wrap:break-word;line-height:1.25;">{value}</div>
-            {delta_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
 
 r1c1, r1c2 = st.columns(2)
 r2c1, r2c2 = st.columns(2)
@@ -512,6 +237,7 @@ with p2:
 st.subheader("Tren & Proyeksi Realisasi hingga Akhir Tahun")
 
 bulan_angka = list(range(1, 13))
+
 
 # Grafik non-kumulatif: nilai realisasi per bulan (biar kelihatan naik-turunnya). Bulan yang
 # belum benar-benar berakhir (lihat bulan_penuh_terakhir) ditampilkan sebagai proyeksi (garis
@@ -585,8 +311,15 @@ else:
 
 st.markdown("**Realisasi Bulanan per Jenis Belanja**")
 
-BARIS_TOTAL_REALISASI_RP = "Total Realisasi (Rp)"
-BARIS_TOTAL_REALISASI_PCT = "Total Realisasi (%)"
+# Tanggal "sd." di judul baris total realisasi disamakan dengan tanggal update file data
+# (lihat tanggal_update_data() di common.py) -- ambil bagian tanggalnya saja, tanpa jam.
+_tgl_update_lengkap = tanggal_update_data()
+_tgl_saja = _tgl_update_lengkap.split(",")[0].strip() if "," in _tgl_update_lengkap else _tgl_update_lengkap
+
+BARIS_TOTAL_REALISASI_RP = f"Total Realisasi (Rp) sd. tanggal {_tgl_saja}"
+BARIS_TOTAL_REALISASI_PCT = f"Total Realisasi (%) sd. tanggal {_tgl_saja}"
+BARIS_SISA_PAGU = "Sisa Pagu"
+BARIS_BLOKIR = "Blokir"
 BARIS_TOTAL_PROYEKSI_RP = "Total Realisasi + Proyeksi Akhir Tahun (Rp)"
 BARIS_TOTAL_PROYEKSI_PCT = "Total Realisasi + Proyeksi Akhir Tahun (%)"
 
@@ -613,26 +346,18 @@ realisasi_aktual_jenis = (
     .reindex(urutan_kode)
 )
 
-proyeksi_per_jenis, _ = hitung_proyeksi_per_jenis(tahun, pagu_per_jenis.reindex(urutan_kode))
+proyeksi_per_jenis, _ = hitung_proyeksi_per_kategori(
+    df, tahun, pagu_per_jenis.reindex(urutan_kode), FILTER_ENTITAS, "LABEL_JENIS_BELANJA"
+)
 
 # Data tampilan per bulan: realisasi aktual utk bulan yang sudah penuh, proyeksi utk bulan
 # yang belum berakhir/belum terjadi (memakai bulan_penuh_terakhir, sama seperti grafik tren).
-tabel_tampil = realisasi_aktual_jenis.copy()
-if bulan_penuh_terakhir < 12:
-    for jb in tabel_tampil.index:
-        proyeksi_jb = proyeksi_per_jenis.get(jb)
-        if proyeksi_jb is None:
-            # tidak ada histori utk jenis belanja ini -> fallback rata-rata realisasi tahun berjalan
-            actual_sum = (
-                tabel_tampil.loc[jb, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
-                if bulan_penuh_terakhir else 0
-            )
-            rerata_jb = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
-            for m in range(bulan_penuh_terakhir, 12):
-                tabel_tampil.loc[jb, BULAN_KOLOM[m]] = rerata_jb
-        else:
-            for m in range(bulan_penuh_terakhir, 12):
-                tabel_tampil.loc[jb, BULAN_KOLOM[m]] = proyeksi_jb[m]
+# Proyeksi selain Belanja Pegawai otomatis dibatasi maks 100% dari pagu -- lihat
+# common.py::isi_tabel_proyeksi utk penjelasan lengkap cara hitungnya.
+tabel_tampil = isi_tabel_proyeksi(
+    realisasi_aktual_jenis, proyeksi_per_jenis, pagu_per_jenis, bulan_penuh_terakhir,
+    kategori_dikecualikan_cap="Belanja Pegawai",
+)
 
 # --- Transpose: baris = bulan, kolom = jenis belanja, + kolom TOTAL di kanan ---
 tabel_t = tabel_tampil.reindex(urutan_kode).T
@@ -652,6 +377,15 @@ total_real_pct = (realisasi_aktual_jenis.sum(axis=1) / pagu_aman * 100).fillna(0
 total_real_pct["TOTAL"] = (total_real_rp["TOTAL"] / pagu_total * 100) if pagu_total else 0
 total_real_pct.name = BARIS_TOTAL_REALISASI_PCT
 
+# Sisa Pagu = Pagu - realisasi AKTUAL (bukan realisasi+proyeksi), per jenis belanja.
+sisa_pagu_row = (pagu_per_jenis.reindex(urutan_kode) - realisasi_aktual_jenis.sum(axis=1))
+sisa_pagu_row["TOTAL"] = pagu_total - total_real_rp["TOTAL"]
+sisa_pagu_row.name = BARIS_SISA_PAGU
+
+blokir_row = df_satker.groupby("LABEL_JENIS_BELANJA")["BLOKIR"].sum().reindex(urutan_kode).fillna(0)
+blokir_row["TOTAL"] = df_satker["BLOKIR"].sum()
+blokir_row.name = BARIS_BLOKIR
+
 total_proyeksi_rp = tabel_tampil.reindex(urutan_kode).sum(axis=1)
 total_proyeksi_rp["TOTAL"] = total_proyeksi_rp.sum()
 total_proyeksi_rp.name = BARIS_TOTAL_PROYEKSI_RP
@@ -665,12 +399,16 @@ tabel_final = pd.concat([
     tabel_t,
     total_real_rp.to_frame().T,
     total_real_pct.to_frame().T,
+    sisa_pagu_row.to_frame().T,
+    blokir_row.to_frame().T,
     total_proyeksi_rp.to_frame().T,
     total_proyeksi_pct.to_frame().T,
 ])
 tabel_final = tabel_final.reindex(columns=urutan_kode + ["TOTAL"])
 
-BARIS_RUPIAH = ["PAGU"] + BULAN_KOLOM + [BARIS_TOTAL_REALISASI_RP, BARIS_TOTAL_PROYEKSI_RP]
+BARIS_RUPIAH = ["PAGU"] + BULAN_KOLOM + [
+    BARIS_TOTAL_REALISASI_RP, BARIS_SISA_PAGU, BARIS_BLOKIR, BARIS_TOTAL_PROYEKSI_RP,
+]
 BARIS_PERSEN = [BARIS_TOTAL_REALISASI_PCT, BARIS_TOTAL_PROYEKSI_PCT]
 
 # Baris bulan yang proyeksi (belum berakhir) ditandai kuning; begitu juga baris ringkasan
@@ -712,18 +450,6 @@ st.caption(
 )
 
 st.divider()
-
-
-# --------------------------------------------------------------------------
-# Groq helper
-# --------------------------------------------------------------------------
-
-def get_groq_client():
-    api_key = st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None
-    api_key = api_key or os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        return None
-    return Groq(api_key=api_key)
 
 
 # --------------------------------------------------------------------------
@@ -769,6 +495,8 @@ def cari_anggaran(kata_kunci: list, provinsi: str = None, tahun_cari: int = None
         .sort_values("PAGU", ascending=False)
         .head(30)
     )
+    rincian["KDSATKER"] = rincian["KDSATKER"].apply(fmt_satker)
+    rincian["KDDEPT"] = rincian["KDDEPT"].apply(fmt_dept)
 
     return {
         "ditemukan": True,
@@ -856,8 +584,8 @@ def ringkasan_data_untuk_ai() -> str:
         f"- {row.LABEL_JENIS_BELANJA}: Rp {row.REALISASI:,.0f}"
         for row in top3_jenis.itertuples()
     )
-    kddept_ket = f" (kode {kddept})" if kddept is not None else ""
-    kdsatker_ket = f" (kode {kdsatker})" if kdsatker is not None else ""
+    kddept_ket = f" (kode {fmt_dept(kddept)})" if kddept is not None else ""
+    kdsatker_ket = f" (kode {fmt_satker(kdsatker)})" if kdsatker is not None else ""
     return f"""
 Data satker:
 - Kementerian/Lembaga: {nmdept}{kddept_ket}
@@ -889,22 +617,25 @@ else:
     cache_key = f"narasi_{tahun}_{kddept}_{kdsatker}"
     if st.button("Buat / Perbarui Narasi", key=f"btn_{cache_key}"):
         with st.spinner("AI sedang menyusun narasi..."):
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Kamu adalah analis anggaran pemerintah Indonesia. Tulis narasi singkat "
-                            "(1-2 paragraf, bahasa Indonesia formal) yang menjelaskan kondisi pagu dan "
-                            "realisasi anggaran satker berikut, termasuk kecukupan serapan dan proyeksi "
-                            "akhir tahun. Jangan mengulang angka mentah secara berlebihan, fokus pada insight."
-                        ),
-                    },
-                    {"role": "user", "content": ringkasan_data_untuk_ai()},
-                ],
-            )
-            st.session_state[cache_key] = resp.choices[0].message.content
+            try:
+                resp = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Kamu adalah analis anggaran pemerintah Indonesia. Tulis narasi singkat "
+                                "(1-2 paragraf, bahasa Indonesia formal) yang menjelaskan kondisi pagu dan "
+                                "realisasi anggaran satker berikut, termasuk kecukupan serapan dan proyeksi "
+                                "akhir tahun. Jangan mengulang angka mentah secara berlebihan, fokus pada insight."
+                            ),
+                        },
+                        {"role": "user", "content": ringkasan_data_untuk_ai()},
+                    ],
+                )
+                st.session_state[cache_key] = resp.choices[0].message.content
+            except Exception as e:
+                st.error(f"Gagal membuat narasi karena gangguan AI ({type(e).__name__}). Coba lagi.")
 
     if cache_key in st.session_state:
         st.write(st.session_state[cache_key])

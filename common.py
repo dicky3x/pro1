@@ -1,0 +1,646 @@
+"""
+common.py
+----------
+Modul bersama dipakai oleh Halaman 1 (app.py), Halaman 2 (pages/2_*.py), dan
+Halaman 3 (pages/3_*.py): loading data, login, format kode, proyeksi, dan helper Groq/KPI.
+"""
+
+import os
+import subprocess
+from datetime import date, datetime as _dt
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from groq import Groq
+
+# --------------------------------------------------------------------------
+# Konstanta umum
+# --------------------------------------------------------------------------
+
+BULAN_KOLOM = ["JAN", "FEB", "MAR", "APR", "MEI", "JUN",
+               "JUL", "AGS", "SEP", "OKT", "NOV", "DES"]
+BULAN_LABEL = {i + 1: b for i, b in enumerate(BULAN_KOLOM)}
+
+# Label jenis belanja versi singkat -- menggantikan label panjang bawaan data sumber.
+LABEL_JENIS_BELANJA_SINGKAT = {
+    51: "Belanja Pegawai",
+    52: "Belanja Barang",
+    53: "Belanja Modal",
+    54: "Belanja Bunga Utang",
+    55: "Belanja Subsidi",
+    56: "Belanja Hibah",
+    57: "Belanja Bansos",
+    58: "Belanja Lain-lain",
+    61: "TKD DBH",
+    62: "TKD DAU",
+    63: "TKD DAK Fisik",
+    64: "TKD Insentif Fiskal",
+    65: "TKD DAK Nonfisik",
+    66: "TKD Dana Desa",
+}
+
+# Kode jenis belanja yang termasuk kategori Transfer ke Daerah (dipakai Halaman 3).
+KODE_JENIS_TKD = [61, 62, 63, 64, 65, 66]
+
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# openai/gpt-oss-120b kadang tidak stabil untuk tool/function calling di Groq (error
+# "tool_use_failed" / 400 BadRequestError sudah dilaporkan komunitas Groq). Kalau panggilan
+# ber-tool gagal, dicoba ulang sekali pakai model cadangan ini.
+GROQ_MODEL_FALLBACK_TOOLS = os.environ.get("GROQ_MODEL_FALLBACK_TOOLS", "moonshotai/kimi-k2-instruct-0905")
+
+BOBOT_TAHUN = {1: 0.50, 2: 0.25, 3: 0.125, 4: 0.0625, 5: 0.0625}
+
+
+def fmt_satker(kode) -> str:
+    """Format kode satker jadi 6 digit dengan angka 0 di depan kalau kurang dari 6 digit."""
+    if kode is None:
+        return ""
+    try:
+        return f"{int(kode):06d}"
+    except (TypeError, ValueError):
+        return str(kode)
+
+
+def fmt_dept(kode) -> str:
+    """Format kode kementerian/lembaga jadi 3 digit dengan angka 0 di depan kalau kurang dari 3 digit."""
+    if kode is None:
+        return ""
+    try:
+        return f"{int(kode):03d}"
+    except (TypeError, ValueError):
+        return str(kode)
+
+
+# --------------------------------------------------------------------------
+# Load data -- dashboard pagu/realisasi satker (Halaman 1 & 3)
+# --------------------------------------------------------------------------
+
+@st.cache_data(show_spinner="Memuat data...")
+def load_data_from_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner="Memuat data dari Supabase...")
+def load_data_from_supabase(url: str, key: str, table: str) -> pd.DataFrame:
+    from supabase import create_client
+
+    client = create_client(url, key)
+    all_rows, page, page_size = [], 0, 1000
+    while True:
+        resp = (
+            client.table(table)
+            .select("*")
+            .range(page * page_size, (page + 1) * page_size - 1)
+            .execute()
+        )
+        rows = resp.data
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        page += 1
+    return pd.DataFrame(all_rows)
+
+
+def load_data() -> pd.DataFrame:
+    use_supabase = st.secrets.get("USE_SUPABASE", "false") == "true" if hasattr(st, "secrets") else False
+    if use_supabase:
+        return load_data_from_supabase(
+            st.secrets["SUPABASE_URL"],
+            st.secrets["SUPABASE_KEY"],
+            st.secrets.get("SUPABASE_TABLE", "pagu_realisasi"),
+        )
+    return load_data_from_csv("data/pagu_realisasi.csv.gz")
+
+
+@st.cache_data(show_spinner=False)
+def tanggal_update_data(path_csv: str = "data/pagu_realisasi.csv.gz") -> str:
+    """Tanggal 'data terakhir diperbarui', diambil dari tanggal commit git terakhir yang
+    mengubah file data ini di GitHub. Fallback ke waktu modifikasi file di disk kalau bukan repo git."""
+    nama_bulan = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+                  "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+
+    def _format(dt):
+        return f"{dt.day} {nama_bulan[dt.month - 1]} {dt.year}, {dt.strftime('%H:%M')}"
+
+    try:
+        hasil = subprocess.run(
+            ["git", "log", "-1", "--format=%cI", "--", path_csv],
+            capture_output=True, text=True, timeout=5,
+        )
+        tanggal_str = hasil.stdout.strip()
+        if tanggal_str:
+            return _format(_dt.fromisoformat(tanggal_str))
+    except Exception:
+        pass
+
+    try:
+        return _format(_dt.fromtimestamp(os.path.getmtime(path_csv))) + " (perkiraan)"
+    except Exception:
+        return "tidak diketahui"
+
+
+KOLOM_TEKS_CARI = [
+    "NMDEPT", "NMSATKER", "PROVINSI", "KABKOTA", "FUNGSI", "SUBFUNGSI",
+    "PROGRAM", "KEGIATAN", "OUTPUT", "AKUN",
+]
+
+
+@st.cache_data(show_spinner="Menyiapkan data...")
+def siapkan_data(df_mentah: pd.DataFrame) -> pd.DataFrame:
+    d = df_mentah.copy()
+    # REALISASI & SISA PAGU dihitung ulang dari total kolom bulanan (JAN..DES) supaya semua
+    # angka konsisten dengan rincian bulanannya.
+    d["REALISASI"] = d[BULAN_KOLOM].sum(axis=1)
+    d["SISA PAGU"] = d["PAGU"] - d["REALISASI"]
+
+    d["LABEL_JENIS_BELANJA"] = (
+        d["JENIS BELANJA"].map(LABEL_JENIS_BELANJA_SINGKAT).fillna(d["LABEL_JENIS_BELANJA"])
+    )
+
+    kolom_ada = [c for c in KOLOM_TEKS_CARI if c in d.columns]
+    if kolom_ada:
+        d["_TEKS_CARI"] = (
+            d[kolom_ada].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        )
+    else:
+        d["_TEKS_CARI"] = ""
+    return d
+
+
+@st.cache_resource(show_spinner=False)
+def get_data() -> pd.DataFrame:
+    """Data utama (pagu/realisasi satker), sudah lewat siapkan_data(). Dipanggil sekali,
+    dipakai bersama oleh Halaman 1 & 3 (cache_resource supaya objeknya sama & tidak
+    di-copy ulang tiap halaman dibuka)."""
+    return siapkan_data(load_data())
+
+
+# --------------------------------------------------------------------------
+# Login -- dipakai semua halaman (SATU sesi login berlaku utk semua halaman)
+# --------------------------------------------------------------------------
+# Username & password = kode satker masing-masing. Ada satu super user (kanwil04/admin)
+# yang bisa melihat seluruh data semua satker.
+
+SUPERUSER_USERNAME = "kanwil04"
+SUPERUSER_PASSWORD = "admin"
+
+
+def _cek_login(username: str, password: str, df_all: pd.DataFrame):
+    username = (username or "").strip()
+    password = (password or "").strip()
+    if username == SUPERUSER_USERNAME and password == SUPERUSER_PASSWORD:
+        return {"role": "super", "kdsatker": None}
+    if username and username == password and username.isdigit():
+        kdsatker = int(username)
+        if kdsatker in df_all["KDSATKER"].unique():
+            return {"role": "satker", "kdsatker": kdsatker}
+    return None
+
+
+def require_login(df_all: pd.DataFrame, judul_halaman: str = "Dashboard"):
+    """Panggil di awal SETIAP halaman. Menampilkan form login & menghentikan halaman
+    (st.stop()) kalau belum login, atau menampilkan status login + tombol logout di
+    sidebar kalau sudah. Return dict auth ({'role':..., 'kdsatker':...})."""
+    if "auth" not in st.session_state:
+        st.session_state.auth = None
+
+    if st.session_state.auth is None:
+        st.title(f"🔐 Login {judul_halaman}")
+        st.caption(
+            "Login memakai kode satker Anda sebagai username maupun password. Setelah login, "
+            "Anda hanya bisa melihat data satker Anda sendiri di semua halaman dashboard."
+        )
+        with st.form("form_login"):
+            username_input = st.text_input("Username (kode satker, 6 digit)", placeholder="mis. 012345")
+            password_input = st.text_input("Password", type="password")
+            submit_login = st.form_submit_button("Login")
+        if submit_login:
+            hasil_login = _cek_login(username_input, password_input, df_all)
+            if hasil_login:
+                st.session_state.auth = hasil_login
+                st.rerun()
+            else:
+                st.error("Username atau password salah, atau kode satker tidak ditemukan di data.")
+        st.stop()
+
+    auth = st.session_state.auth
+    is_super = auth["role"] == "super"
+
+    with st.sidebar:
+        if is_super:
+            st.success(f"👤 Super User ({SUPERUSER_USERNAME})")
+        else:
+            st.success(f"👤 Satker: {fmt_satker(auth['kdsatker'])}")
+        if st.button("🚪 Logout"):
+            st.session_state.auth = None
+            st.rerun()
+
+    return auth
+
+
+# --------------------------------------------------------------------------
+# Proyeksi -- rerata tertimbang tingkat realisasi 5 tahun sebelumnya x pagu tahun berjalan
+#
+#   proyeksi_bulan_m = pagu_tahun_ini * [ Σ bobot_i * (realisasi_bulan_m_tahun(y-i) / pagu_tahun(y-i)) ] / Σ bobot_i
+#
+# Fungsi generik (bisa dipakai filter satker/kementerian ATAU kabupaten/kota) -- filter_dict
+# berisi pasangan {nama_kolom: nilai}, mis. {"KDDEPT": 15, "KDSATKER": 613739} atau
+# {"KABKOTA": "KAB. KAMPAR"}. Nilai None di filter_dict berarti tidak difilter (semua).
+# --------------------------------------------------------------------------
+
+def _filter_entitas(df_all: pd.DataFrame, thn: int, filter_dict: dict) -> pd.DataFrame:
+    d = df_all[df_all["TAHUN"] == thn]
+    for kolom, nilai in filter_dict.items():
+        if nilai is not None:
+            d = d[d[kolom] == nilai]
+    return d
+
+
+def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
+    """Proyeksi 12 bulan (rupiah) untuk seluruh entitas terpilih. Return (array atau None, daftar tahun dipakai)."""
+    total_rate = np.zeros(12)
+    total_bobot = 0.0
+    tahun_dipakai = []
+    for i in range(1, 6):
+        d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+        pagu_prev = d_prev["PAGU"].sum() if not d_prev.empty else 0
+        if pagu_prev <= 0:
+            continue
+        monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+        total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
+        total_bobot += BOBOT_TAHUN[i]
+        tahun_dipakai.append(tahun_y - i)
+    if total_bobot == 0:
+        return None, tahun_dipakai
+    return (total_rate / total_bobot) * pagu_y, tahun_dipakai
+
+
+def hitung_proyeksi_per_kategori(
+    df_all: pd.DataFrame, tahun_y: int, pagu_per_kategori_now: pd.Series,
+    filter_dict: dict, kolom_kategori: str,
+):
+    """Proyeksi 12 bulan (rupiah) per kategori (jenis belanja ATAU jenis transfer).
+    Return dict label -> array(12) atau None (kalau tidak ada histori)."""
+    hasil = {}
+    tahun_dipakai_semua = set()
+    for label, pagu_now in pagu_per_kategori_now.items():
+        total_rate = np.zeros(12)
+        total_bobot = 0.0
+        for i in range(1, 6):
+            d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+            d_prev = d_prev[d_prev[kolom_kategori] == label]
+            pagu_prev = d_prev["PAGU"].sum() if not d_prev.empty else 0
+            if pagu_prev <= 0:
+                continue
+            monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+            total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
+            total_bobot += BOBOT_TAHUN[i]
+            tahun_dipakai_semua.add(tahun_y - i)
+        hasil[label] = (total_rate / total_bobot) * pagu_now if total_bobot > 0 else None
+    return hasil, sorted(tahun_dipakai_semua, reverse=True)
+
+
+def isi_tabel_proyeksi(
+    tabel_aktual: pd.DataFrame, proyeksi_per_kategori: dict, pagu_per_kategori: pd.Series,
+    bulan_penuh_terakhir: int, kategori_dikecualikan_cap: str = "Belanja Pegawai",
+) -> pd.DataFrame:
+    """Isi bulan-bulan setelah bulan_penuh_terakhir dengan proyeksi (bukan double-count -- lihat
+    catatan di app.py), lalu cap total (aktual+proyeksi) maksimal 100% pagu utk kategori selain
+    yang dikecualikan (default: Belanja Pegawai, karena satu-satunya yang boleh >100%)."""
+    tabel_tampil = tabel_aktual.copy()
+    if bulan_penuh_terakhir < 12:
+        for kat in tabel_tampil.index:
+            proyeksi_kat = proyeksi_per_kategori.get(kat)
+            actual_sum = (
+                tabel_tampil.loc[kat, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
+                if bulan_penuh_terakhir else 0
+            )
+            if proyeksi_kat is None:
+                rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
+                for m in range(bulan_penuh_terakhir, 12):
+                    tabel_tampil.loc[kat, BULAN_KOLOM[m]] = rerata_kat
+                continue
+
+            target_tahun_penuh = proyeksi_kat.sum()
+            sisa_target = max(target_tahun_penuh - actual_sum, 0)
+            proyeksi_depan_mentah = proyeksi_kat[bulan_penuh_terakhir:]
+            total_depan_mentah = proyeksi_depan_mentah.sum()
+            if total_depan_mentah > 0:
+                proyeksi_depan = proyeksi_depan_mentah * (sisa_target / total_depan_mentah)
+            else:
+                proyeksi_depan = np.zeros(12 - bulan_penuh_terakhir)
+            for idx, m in enumerate(range(bulan_penuh_terakhir, 12)):
+                tabel_tampil.loc[kat, BULAN_KOLOM[m]] = proyeksi_depan[idx]
+
+    if bulan_penuh_terakhir < 12:
+        for kat in tabel_tampil.index:
+            if kat == kategori_dikecualikan_cap:
+                continue
+            pagu_kat = pagu_per_kategori.get(kat, 0)
+            if not pagu_kat or pagu_kat <= 0:
+                continue
+            actual_sum = tabel_tampil.loc[kat, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
+            proyeksi_depan = tabel_tampil.loc[kat, BULAN_KOLOM[bulan_penuh_terakhir:]]
+            total_proyeksi_depan = proyeksi_depan.sum()
+            sisa_pagu_kat = max(pagu_kat - actual_sum, 0)
+            if total_proyeksi_depan > sisa_pagu_kat:
+                faktor_skala = (sisa_pagu_kat / total_proyeksi_depan) if total_proyeksi_depan > 0 else 0
+                tabel_tampil.loc[kat, BULAN_KOLOM[bulan_penuh_terakhir:]] = proyeksi_depan * faktor_skala
+
+    return tabel_tampil
+
+
+def hitung_bulan_penuh_terakhir(df_entitas: pd.DataFrame, tahun_y: int) -> tuple:
+    """Return (bulan_terakhir, bulan_penuh_terakhir) dari sebuah subset data yang sudah difilter tahun."""
+    monthly = df_entitas[BULAN_KOLOM].sum()
+    bulan_terisi = [i + 1 for i, v in enumerate(monthly.values) if v != 0]
+    bulan_terakhir = max(bulan_terisi) if bulan_terisi else 0
+
+    hari_ini = date.today()
+    if tahun_y < hari_ini.year:
+        bulan_penuh_terakhir = bulan_terakhir
+    elif tahun_y > hari_ini.year:
+        bulan_penuh_terakhir = 0
+    else:
+        bulan_penuh_terakhir = min(bulan_terakhir, hari_ini.month - 1)
+    return bulan_terakhir, bulan_penuh_terakhir
+
+
+# --------------------------------------------------------------------------
+# Groq client & kartu KPI
+# --------------------------------------------------------------------------
+
+def get_groq_client():
+    api_key = st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None
+    api_key = api_key or os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+    return Groq(api_key=api_key)
+
+
+def kpi_card(label: str, value: str, delta: str = None):
+    delta_html = (
+        f'<div style="font-size:0.85rem;color:#16a34a;margin-top:4px;">{delta}</div>'
+        if delta else ""
+    )
+    st.markdown(
+        f"""
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;
+                    padding:16px 18px;min-height:110px;">
+            <div style="font-size:0.85rem;color:#64748b;margin-bottom:6px;">{label}</div>
+            <div style="font-size:clamp(1rem, 2.1vw, 1.6rem);font-weight:700;color:#0f172a;
+                        white-space:normal;overflow-wrap:break-word;line-height:1.25;">{value}</div>
+            {delta_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# --------------------------------------------------------------------------
+# Dashboard generik utk data "kategori" (Prioritas Presiden / Program Strategis) --
+# Halaman 2 & 3 sama-sama memanggil ini karena struktur sumber datanya identik, cuma
+# beda kolom kategori & isinya. Lihat build_prioritas_strategis.py utk cara datanya dibuat.
+#
+# Beda penting dengan Halaman 1/4: file sumbernya HANYA berisi tahun 2026 (belum ada
+# histori tahun sebelumnya), jadi hitung_proyeksi_agregat/per_kategori otomatis fallback
+# ke metode rata-rata bulan berjalan (return None -> tidak ada histori yang bisa dipakai).
+# --------------------------------------------------------------------------
+
+@st.cache_data(show_spinner="Memuat data...")
+def _load_csv_kategori(path: str) -> pd.DataFrame:
+    d = pd.read_csv(path)
+    d["REALISASI"] = d[BULAN_KOLOM].sum(axis=1)
+    d["SISA PAGU"] = d["PAGU"] - d["REALISASI"]
+    return d
+
+
+def render_dashboard_kategori(data_path: str, judul_halaman: str, icon: str, label_kategori: str):
+    """Render dashboard lengkap (filter, KPI, grafik, tabel rincian) untuk data prioritas/
+    strategis. Dipanggil oleh pages/2_*.py (Prioritas Presiden) & pages/3_*.py (Program
+    Strategis) dengan parameter berbeda.
+
+    data_path: path file CSV (gzip) hasil olahan build_prioritas_strategis.py
+    judul_halaman: judul ditampilkan di halaman, mis. "Dashboard Prioritas Presiden"
+    icon: emoji ikon halaman
+    label_kategori: nama kolom kategori utk ditampilkan di UI, mis. "Prioritas Presiden"
+    """
+    if not os.path.exists(data_path):
+        st.warning(f"Halaman ini belum aktif -- file data belum tersedia di `{data_path}`.")
+        st.stop()
+
+    df = _load_csv_kategori(data_path)
+
+    # --- Sidebar filter ---
+    st.sidebar.header("Filter")
+    tahun_list = sorted(df["TAHUN"].unique(), reverse=True)
+    tahun = st.sidebar.selectbox("Tahun", tahun_list)
+    df_tahun = df[df["TAHUN"] == tahun]
+
+    semua_kategori_label = f"— Semua {label_kategori} —"
+    kategori_list = sorted(df_tahun["KATEGORI"].dropna().unique().tolist())
+    kategori_pilih = st.sidebar.selectbox(label_kategori, [semua_kategori_label] + kategori_list)
+
+    if kategori_pilih == semua_kategori_label:
+        kategori = None
+        df_scope = df_tahun
+    else:
+        kategori = kategori_pilih
+        df_scope = df_tahun[df_tahun["KATEGORI"] == kategori]
+
+    # --- Agregasi ---
+    pagu_total = df_scope["PAGU"].sum()
+    realisasi_total = df_scope["REALISASI"].sum()
+    sisa_pagu = df_scope["SISA PAGU"].sum()
+    persen_serapan = (realisasi_total / pagu_total * 100) if pagu_total else 0
+
+    monthly = df_scope[BULAN_KOLOM].sum()
+    kumulatif = monthly.cumsum()
+    bulan_terakhir, bulan_penuh_terakhir = hitung_bulan_penuh_terakhir(df_scope, tahun)
+
+    # --- Proyeksi (fallback otomatis krn data cuma 1 tahun -- lihat catatan di atas) ---
+    filter_entitas = {"KATEGORI": kategori}
+    proyeksi_agregat_bulanan, tahun_dipakai = hitung_proyeksi_agregat(df, tahun, pagu_total, filter_entitas)
+    if proyeksi_agregat_bulanan is None:
+        rerata_bulanan = (kumulatif.iloc[bulan_terakhir - 1] / bulan_terakhir) if bulan_terakhir else 0
+        proyeksi_akhir_tahun = rerata_bulanan * 12
+        metode_proyeksi = "fallback"
+    else:
+        target_tahun_penuh = proyeksi_agregat_bulanan.sum()
+        proyeksi_akhir_tahun = max(realisasi_total, target_tahun_penuh)
+        metode_proyeksi = "historis"
+    persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
+
+    # --- Header & KPI ---
+    st.title(f"{icon} {judul_halaman}")
+    st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data(data_path)}")
+    st.caption(f"{kategori or f'Semua {label_kategori}'} — Tahun {tahun}")
+
+    r1c1, r1c2 = st.columns(2)
+    r2c1, r2c2 = st.columns(2)
+    with r1c1:
+        kpi_card("Pagu", f"Rp {pagu_total:,.0f}")
+    with r1c2:
+        kpi_card("Realisasi", f"Rp {realisasi_total:,.0f}", f"{persen_serapan:.1f}% dari pagu")
+    with r2c1:
+        kpi_card("Sisa Pagu", f"Rp {sisa_pagu:,.0f}")
+    with r2c2:
+        kpi_card(
+            "Proyeksi Realisasi Akhir Tahun",
+            f"Rp {proyeksi_akhir_tahun:,.0f}",
+            f"{persen_proyeksi:.1f}% dari pagu",
+        )
+
+    st.divider()
+
+    # --- Grafik batang ---
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        st.subheader("Realisasi per Bulan")
+        bar_df = pd.DataFrame({"Bulan": BULAN_KOLOM, "Realisasi": monthly.values})
+        fig_bar = px.bar(bar_df, x="Bulan", y="Realisasi", text_auto=".2s")
+        fig_bar.update_layout(yaxis_title="Rupiah", xaxis_title=None)
+        st.plotly_chart(fig_bar, use_container_width=True)
+    with col2:
+        st.subheader("Pagu vs Realisasi")
+        fig_pv = go.Figure(data=[
+            go.Bar(name="Pagu", x=["Total"], y=[pagu_total]),
+            go.Bar(name="Realisasi", x=["Total"], y=[realisasi_total]),
+        ])
+        fig_pv.update_layout(barmode="group", yaxis_title="Rupiah")
+        st.plotly_chart(fig_pv, use_container_width=True)
+
+    # --- Pie charts ---
+    st.subheader("Komposisi")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.caption("Realisasi vs Sisa Pagu")
+        fig_pie1 = px.pie(
+            names=["Realisasi", "Sisa Pagu"], values=[realisasi_total, max(sisa_pagu, 0)], hole=0.4,
+        )
+        st.plotly_chart(fig_pie1, use_container_width=True)
+    with p2:
+        if kategori is None:
+            st.caption(f"Realisasi per {label_kategori}")
+            per_kat = (
+                df_scope.groupby("KATEGORI")["REALISASI"].sum()
+                .sort_values(ascending=False).reset_index()
+            )
+            fig_pie2 = px.pie(per_kat, names="KATEGORI", values="REALISASI", hole=0.4)
+        else:
+            st.caption("Realisasi per Kabupaten/Kota")
+            per_wil = (
+                df_scope.groupby("KABKOTA")["REALISASI"].sum()
+                .sort_values(ascending=False).reset_index()
+            )
+            fig_pie2 = px.pie(per_wil, names="KABKOTA", values="REALISASI", hole=0.4)
+        st.plotly_chart(fig_pie2, use_container_width=True)
+
+    # --- Perbandingan antar kategori (hanya kalau "Semua" dipilih) ---
+    if kategori is None:
+        st.subheader(f"Perbandingan antar {label_kategori}")
+        per_kat_tabel = (
+            df_tahun.groupby("KATEGORI")
+            .agg(Pagu=("PAGU", "sum"), Realisasi=("REALISASI", "sum"))
+            .reset_index()
+            .sort_values("Pagu", ascending=False)
+        )
+        per_kat_tabel["Persen Realisasi"] = (
+            per_kat_tabel["Realisasi"] / per_kat_tabel["Pagu"].replace(0, np.nan) * 100
+        ).fillna(0)
+
+        fig_kat = go.Figure(data=[
+            go.Bar(name="Pagu", x=per_kat_tabel["KATEGORI"], y=per_kat_tabel["Pagu"]),
+            go.Bar(name="Realisasi", x=per_kat_tabel["KATEGORI"], y=per_kat_tabel["Realisasi"]),
+        ])
+        fig_kat.update_layout(barmode="group", yaxis_title="Rupiah", xaxis_title=None)
+        st.plotly_chart(fig_kat, use_container_width=True)
+
+        st.dataframe(
+            per_kat_tabel.style.format({
+                "Pagu": "Rp {:,.0f}", "Realisasi": "Rp {:,.0f}", "Persen Realisasi": "{:.1f}%",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        st.divider()
+
+    # --- Trend chart ---
+    st.subheader("Tren & Proyeksi Realisasi hingga Akhir Tahun")
+    bulan_angka = list(range(1, 13))
+
+    def _nilai_proyeksi_bulan(b):
+        if proyeksi_agregat_bulanan is not None:
+            return proyeksi_agregat_bulanan[b - 1]
+        return rerata_bulanan
+
+    aktual = [monthly.values[b - 1] if b <= bulan_penuh_terakhir else None for b in bulan_angka]
+    proyeksi = []
+    for b in bulan_angka:
+        if bulan_penuh_terakhir == 0:
+            proyeksi.append(_nilai_proyeksi_bulan(b))
+        elif b < bulan_penuh_terakhir:
+            proyeksi.append(None)
+        elif b == bulan_penuh_terakhir:
+            proyeksi.append(monthly.values[b - 1])
+        else:
+            proyeksi.append(_nilai_proyeksi_bulan(b))
+
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(
+        x=BULAN_KOLOM, y=aktual, mode="lines+markers", name="Realisasi per Bulan (Aktual)",
+        line=dict(width=3, shape="spline", smoothing=1.1),
+    ))
+    fig_trend.add_trace(go.Scatter(
+        x=BULAN_KOLOM, y=proyeksi, mode="lines+markers", name="Proyeksi (rata-rata bulanan)",
+        line=dict(dash="dash", shape="spline", smoothing=1.1),
+    ))
+    fig_trend.update_layout(yaxis_title="Rupiah (per bulan)", xaxis_title=None)
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    _label_batas = BULAN_LABEL.get(bulan_penuh_terakhir, "-") if bulan_penuh_terakhir else None
+    _batas_teks = f"Bulan setelah {_label_batas}" if _label_batas else "Seluruh bulan tahun ini"
+
+    if metode_proyeksi == "historis":
+        daftar_tahun_ket = ", ".join(str(t) for t in tahun_dipakai)
+        st.caption(
+            f"Grafik ini menampilkan realisasi tiap bulan (bukan kumulatif). {_batas_teks} "
+            "adalah proyeksi yang dihitung dari rerata tertimbang tingkat realisasi tahun-tahun "
+            f"sebelumnya dikalikan pagu tahun {tahun}. Tahun historis yang dipakai: {daftar_tahun_ket}."
+        )
+    else:
+        st.caption(
+            f"Grafik ini menampilkan realisasi tiap bulan (bukan kumulatif). {_batas_teks} "
+            f"adalah proyeksi. Data {label_kategori} baru tersedia untuk tahun {tahun} saja "
+            "(belum ada histori tahun sebelumnya di file sumber ini), sehingga proyeksi memakai "
+            "metode cadangan: rata-rata realisasi per bulan pada tahun berjalan dikalikan 12 bulan."
+        )
+
+    st.divider()
+
+    # --- Tabel rincian kegiatan/output/suboutput ---
+    st.markdown(f"**Rincian {label_kategori}**")
+    kolom_tampil = [
+        "NMDEPT", "NMSATKER", "KABKOTA", "KEGIATAN", "OUTPUT", "SUBOUTPUT", "AKUN",
+        "PAGU", "REALISASI",
+    ]
+    if kategori is None:
+        kolom_tampil = ["KATEGORI"] + kolom_tampil
+    rincian = df_scope[kolom_tampil].copy()
+    rincian["Persen Realisasi"] = (
+        rincian["REALISASI"] / rincian["PAGU"].replace(0, np.nan) * 100
+    ).fillna(0)
+    rincian = rincian.sort_values("PAGU", ascending=False)
+
+    st.dataframe(
+        rincian.style.format({
+            "PAGU": "Rp {:,.0f}", "REALISASI": "Rp {:,.0f}", "Persen Realisasi": "{:.1f}%",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Tabel ini menampilkan rincian tiap baris kegiatan/output/suboutput yang termasuk "
+        f"{label_kategori.lower()}, diurutkan dari pagu terbesar."
+    )
