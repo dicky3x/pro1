@@ -51,28 +51,6 @@ LABEL_JENIS_BELANJA_SINGKAT = {
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
-def fmt_satker(kode) -> str:
-    """Format kode satker jadi 6 digit dengan angka 0 di depan kalau kurang dari 6 digit
-    (kode satker resminya selalu 6 digit, mis. 613739, tapi 12345 -> '012345')."""
-    if kode is None:
-        return ""
-    try:
-        return f"{int(kode):06d}"
-    except (TypeError, ValueError):
-        return str(kode)
-
-
-def fmt_dept(kode) -> str:
-    """Format kode kementerian/lembaga jadi 3 digit dengan angka 0 di depan kalau kurang
-    dari 3 digit (kode kementerian resminya selalu 3 digit, mis. 015, tapi 5 -> '005')."""
-    if kode is None:
-        return ""
-    try:
-        return f"{int(kode):03d}"
-    except (TypeError, ValueError):
-        return str(kode)
-
-
 # --------------------------------------------------------------------------
 # Load data
 # --------------------------------------------------------------------------
@@ -215,7 +193,7 @@ if st.session_state.auth is None:
         "Anda hanya bisa melihat data satker Anda sendiri."
     )
     with st.form("form_login"):
-        username_input = st.text_input("Username (kode satker, 6 digit)", placeholder="mis. 012345")
+        username_input = st.text_input("Username (kode satker)")
         password_input = st.text_input("Password", type="password")
         submit_login = st.form_submit_button("Login")
     if submit_login:
@@ -234,7 +212,7 @@ with st.sidebar:
     if is_super:
         st.success(f"👤 Super User ({SUPERUSER_USERNAME})")
     else:
-        st.success(f"👤 Satker: {fmt_satker(auth['kdsatker'])}")
+        st.success(f"👤 Satker: {auth['kdsatker']}")
     if st.button("🚪 Logout"):
         st.session_state.auth = None
         st.rerun()
@@ -264,7 +242,7 @@ if is_super:
         .drop_duplicates()
         .sort_values("KDDEPT")
     )
-    dept_options["LABEL"] = dept_options["KDDEPT"].apply(fmt_dept) + " - " + dept_options["NMDEPT"]
+    dept_options["LABEL"] = dept_options["KDDEPT"].astype(str) + " - " + dept_options["NMDEPT"]
     dept_label = st.sidebar.selectbox("Kementerian/Lembaga", [SEMUA_DEPT] + dept_options["LABEL"].tolist())
 
     if dept_label == SEMUA_DEPT:
@@ -281,7 +259,7 @@ if is_super:
         .drop_duplicates()
         .sort_values("KDSATKER")
     )
-    satker_options["LABEL"] = satker_options["KDSATKER"].apply(fmt_satker) + " - " + satker_options["NMSATKER"]
+    satker_options["LABEL"] = satker_options["KDSATKER"].astype(str) + " - " + satker_options["NMSATKER"]
     satker_label = st.sidebar.selectbox("Satuan Kerja (Satker)", [SEMUA_SATKER] + satker_options["LABEL"].tolist())
 
     if satker_label == SEMUA_SATKER:
@@ -299,7 +277,7 @@ else:
 
     tahun_list = sorted(df_kdsatker_semua_tahun["TAHUN"].unique(), reverse=True)
     if not tahun_list:
-        st.error(f"Tidak ada data untuk satker dengan kode {fmt_satker(kdsatker)}.")
+        st.error(f"Tidak ada data untuk satker dengan kode {kdsatker}.")
         st.stop()
     tahun = st.sidebar.selectbox("Tahun", tahun_list)
 
@@ -317,8 +295,8 @@ else:
         nmdept = df_satker["NMDEPT"].iloc[0]
         df_dept = df_tahun[df_tahun["KDDEPT"] == kddept]
 
-    st.sidebar.caption(f"Satker: **{fmt_satker(kdsatker)} - {nmsatker}**")
-    st.sidebar.caption(f"Kementerian/Lembaga: {fmt_dept(kddept)} - {nmdept}")
+    st.sidebar.caption(f"Satker: **{kdsatker} - {nmsatker}**")
+    st.sidebar.caption(f"Kementerian/Lembaga: {nmdept}")
 
 
 # --------------------------------------------------------------------------
@@ -428,13 +406,9 @@ if proyeksi_agregat_bulanan is None:
     proyeksi_akhir_tahun = rerata_bulanan * 12
     metode_proyeksi = "fallback"
 else:
-    # Target satu tahun penuh berdasarkan rerata tertimbang tingkat realisasi historis
-    # (proyeksi_agregat_bulanan sudah dalam rupiah per bulan; jumlah 12 bulannya = tingkat
-    # realisasi historis x pagu tahun ini). Proyeksi akhir tahun = target itu, ATAU realisasi
-    # aktual sekarang kalau realisasi aktual sudah melebihi target itu sendiri (tidak mungkin
-    # proyeksi akhir tahun lebih kecil dari yang sudah benar-benar terealisasi).
-    target_tahun_penuh = proyeksi_agregat_bulanan.sum()
-    proyeksi_akhir_tahun = max(realisasi_total, target_tahun_penuh)
+    proyeksi_akhir_tahun = realisasi_total + sum(
+        proyeksi_agregat_bulanan[m] for m in range(bulan_terakhir, 12)
+    )
     metode_proyeksi = "historis"
 
 persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
@@ -611,15 +585,8 @@ else:
 
 st.markdown("**Realisasi Bulanan per Jenis Belanja**")
 
-# Tanggal "sd." di judul baris total realisasi disamakan dengan tanggal update file data
-# (lihat tanggal_update_data() di atas) -- ambil bagian tanggalnya saja, tanpa jam.
-_tgl_update_lengkap = tanggal_update_data()
-_tgl_saja = _tgl_update_lengkap.split(",")[0].strip() if "," in _tgl_update_lengkap else _tgl_update_lengkap
-
-BARIS_TOTAL_REALISASI_RP = f"Total Realisasi (Rp) sd. tanggal {_tgl_saja}"
-BARIS_TOTAL_REALISASI_PCT = f"Total Realisasi (%) sd. tanggal {_tgl_saja}"
-BARIS_SISA_PAGU = "Sisa Pagu"
-BARIS_BLOKIR = "Blokir"
+BARIS_TOTAL_REALISASI_RP = "Total Realisasi (Rp)"
+BARIS_TOTAL_REALISASI_PCT = "Total Realisasi (%)"
 BARIS_TOTAL_PROYEKSI_RP = "Total Realisasi + Proyeksi Akhir Tahun (Rp)"
 BARIS_TOTAL_PROYEKSI_PCT = "Total Realisasi + Proyeksi Akhir Tahun (%)"
 
@@ -650,65 +617,22 @@ proyeksi_per_jenis, _ = hitung_proyeksi_per_jenis(tahun, pagu_per_jenis.reindex(
 
 # Data tampilan per bulan: realisasi aktual utk bulan yang sudah penuh, proyeksi utk bulan
 # yang belum berakhir/belum terjadi (memakai bulan_penuh_terakhir, sama seperti grafik tren).
-#
-# PENTING soal cara proyeksi dihitung: proyeksi_jb (dari hitung_proyeksi_per_jenis) adalah
-# rincian 12 bulan berdasarkan pola historis, dan JUMLAH ke-12 bulan itu = tingkat realisasi
-# historis x pagu tahun ini ("target_tahun_penuh"). Bulan-bulan yang sudah PENUH memakai
-# realisasi AKTUAL (bukan angka historis), jadi proyeksi utk bulan-bulan SISA harus diisi
-# hanya sebesar SISA dari target_tahun_penuh (target dikurangi aktual yang sudah berjalan),
-# bukan menambahkan mentah-mentah proyeksi bulanan historisnya di atas aktual -- kalau tidak,
-# hasilnya bisa dobel hitung dan totalnya melebihi yang seharusnya (mis. tingkat realisasi
-# historis satker tertentu untuk jenis belanja tertentu cuma 99%, tapi total akhirnya malah
-# tampil >100% karena proyeksi bulan sisa dihitung ulang dari awal, bukan dari sisa targetnya).
 tabel_tampil = realisasi_aktual_jenis.copy()
 if bulan_penuh_terakhir < 12:
     for jb in tabel_tampil.index:
         proyeksi_jb = proyeksi_per_jenis.get(jb)
-        actual_sum = (
-            tabel_tampil.loc[jb, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
-            if bulan_penuh_terakhir else 0
-        )
-
         if proyeksi_jb is None:
             # tidak ada histori utk jenis belanja ini -> fallback rata-rata realisasi tahun berjalan
+            actual_sum = (
+                tabel_tampil.loc[jb, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
+                if bulan_penuh_terakhir else 0
+            )
             rerata_jb = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
             for m in range(bulan_penuh_terakhir, 12):
                 tabel_tampil.loc[jb, BULAN_KOLOM[m]] = rerata_jb
-            continue
-
-        target_tahun_penuh = proyeksi_jb.sum()
-        sisa_target = max(target_tahun_penuh - actual_sum, 0)
-
-        proyeksi_depan_mentah = proyeksi_jb[bulan_penuh_terakhir:]
-        total_depan_mentah = proyeksi_depan_mentah.sum()
-        if total_depan_mentah > 0:
-            proyeksi_depan = proyeksi_depan_mentah * (sisa_target / total_depan_mentah)
         else:
-            proyeksi_depan = np.zeros(12 - bulan_penuh_terakhir)
-
-        for idx, m in enumerate(range(bulan_penuh_terakhir, 12)):
-            tabel_tampil.loc[jb, BULAN_KOLOM[m]] = proyeksi_depan[idx]
-
-# Batasi proyeksi: selain Belanja Pegawai, total (realisasi aktual + proyeksi) per jenis
-# belanja tidak boleh melebihi 100% dari pagu jenis belanja itu sendiri -- ini jaga-jaga kalau
-# tingkat realisasi historisnya sendiri kebetulan >100% (mis. anomali data), atau realisasi
-# aktual yang sudah berjalan saja sudah dekat/lebih dari pagu. Kalau proyeksi mentahnya lebih
-# besar dari sisa pagu, bulan-bulan proyeksi diskalakan turun proporsional (bentuk/pola
-# bulanannya tetap sama, cuma totalnya dipangkas pas di 100%).
-if bulan_penuh_terakhir < 12:
-    for jb in tabel_tampil.index:
-        if jb == "Belanja Pegawai":
-            continue
-        pagu_jb = pagu_per_jenis.get(jb, 0)
-        if not pagu_jb or pagu_jb <= 0:
-            continue
-        actual_sum = tabel_tampil.loc[jb, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
-        proyeksi_depan = tabel_tampil.loc[jb, BULAN_KOLOM[bulan_penuh_terakhir:]]
-        total_proyeksi_depan = proyeksi_depan.sum()
-        sisa_pagu_jb = max(pagu_jb - actual_sum, 0)
-        if total_proyeksi_depan > sisa_pagu_jb:
-            faktor_skala = (sisa_pagu_jb / total_proyeksi_depan) if total_proyeksi_depan > 0 else 0
-            tabel_tampil.loc[jb, BULAN_KOLOM[bulan_penuh_terakhir:]] = proyeksi_depan * faktor_skala
+            for m in range(bulan_penuh_terakhir, 12):
+                tabel_tampil.loc[jb, BULAN_KOLOM[m]] = proyeksi_jb[m]
 
 # --- Transpose: baris = bulan, kolom = jenis belanja, + kolom TOTAL di kanan ---
 tabel_t = tabel_tampil.reindex(urutan_kode).T
@@ -728,15 +652,6 @@ total_real_pct = (realisasi_aktual_jenis.sum(axis=1) / pagu_aman * 100).fillna(0
 total_real_pct["TOTAL"] = (total_real_rp["TOTAL"] / pagu_total * 100) if pagu_total else 0
 total_real_pct.name = BARIS_TOTAL_REALISASI_PCT
 
-# Sisa Pagu = Pagu - realisasi AKTUAL (bukan realisasi+proyeksi), per jenis belanja.
-sisa_pagu_row = (pagu_per_jenis.reindex(urutan_kode) - realisasi_aktual_jenis.sum(axis=1))
-sisa_pagu_row["TOTAL"] = pagu_total - total_real_rp["TOTAL"]
-sisa_pagu_row.name = BARIS_SISA_PAGU
-
-blokir_row = df_satker.groupby("LABEL_JENIS_BELANJA")["BLOKIR"].sum().reindex(urutan_kode).fillna(0)
-blokir_row["TOTAL"] = df_satker["BLOKIR"].sum()
-blokir_row.name = BARIS_BLOKIR
-
 total_proyeksi_rp = tabel_tampil.reindex(urutan_kode).sum(axis=1)
 total_proyeksi_rp["TOTAL"] = total_proyeksi_rp.sum()
 total_proyeksi_rp.name = BARIS_TOTAL_PROYEKSI_RP
@@ -750,16 +665,12 @@ tabel_final = pd.concat([
     tabel_t,
     total_real_rp.to_frame().T,
     total_real_pct.to_frame().T,
-    sisa_pagu_row.to_frame().T,
-    blokir_row.to_frame().T,
     total_proyeksi_rp.to_frame().T,
     total_proyeksi_pct.to_frame().T,
 ])
 tabel_final = tabel_final.reindex(columns=urutan_kode + ["TOTAL"])
 
-BARIS_RUPIAH = ["PAGU"] + BULAN_KOLOM + [
-    BARIS_TOTAL_REALISASI_RP, BARIS_SISA_PAGU, BARIS_BLOKIR, BARIS_TOTAL_PROYEKSI_RP,
-]
+BARIS_RUPIAH = ["PAGU"] + BULAN_KOLOM + [BARIS_TOTAL_REALISASI_RP, BARIS_TOTAL_PROYEKSI_RP]
 BARIS_PERSEN = [BARIS_TOTAL_REALISASI_PCT, BARIS_TOTAL_PROYEKSI_PCT]
 
 # Baris bulan yang proyeksi (belum berakhir) ditandai kuning; begitu juga baris ringkasan
@@ -858,8 +769,6 @@ def cari_anggaran(kata_kunci: list, provinsi: str = None, tahun_cari: int = None
         .sort_values("PAGU", ascending=False)
         .head(30)
     )
-    rincian["KDSATKER"] = rincian["KDSATKER"].apply(fmt_satker)
-    rincian["KDDEPT"] = rincian["KDDEPT"].apply(fmt_dept)
 
     return {
         "ditemukan": True,
@@ -947,8 +856,8 @@ def ringkasan_data_untuk_ai() -> str:
         f"- {row.LABEL_JENIS_BELANJA}: Rp {row.REALISASI:,.0f}"
         for row in top3_jenis.itertuples()
     )
-    kddept_ket = f" (kode {fmt_dept(kddept)})" if kddept is not None else ""
-    kdsatker_ket = f" (kode {fmt_satker(kdsatker)})" if kdsatker is not None else ""
+    kddept_ket = f" (kode {kddept})" if kddept is not None else ""
+    kdsatker_ket = f" (kode {kdsatker})" if kdsatker is not None else ""
     return f"""
 Data satker:
 - Kementerian/Lembaga: {nmdept}{kddept_ket}
