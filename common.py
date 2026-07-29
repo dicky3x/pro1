@@ -400,6 +400,265 @@ def kpi_card(label: str, value: str, delta: str = None):
     )
 
 
+def satker_ada_di_path(data_path: str, kdsatker: int) -> bool:
+    """Cek apakah suatu kode satker punya baris data di file CSV kategori (Prioritas
+    Presiden / Program Strategis) -- dipakai app.py utk sembunyikan halaman yang tidak
+    relevan bagi satker yang sedang login."""
+    if kdsatker is None or not os.path.exists(data_path):
+        return False
+    try:
+        d = _load_csv_kategori(data_path)
+    except Exception:
+        return False
+    return kdsatker in d["KDSATKER"].unique()
+
+
+def buat_cari_generik(df_all: pd.DataFrame, kolom_teks: list, scope_kdsatker: int = None):
+    """Bikin fungsi pencarian generik (dipakai tool-calling AI di chat box) yang mencari
+    kata kunci di kolom_teks, opsional filter provinsi & tahun, dan opsional dibatasi ke
+    satu KDSATKER saja (utk user satker biasa). Hasil dikelompokkan per satker.
+
+    Return: fungsi cari(kata_kunci, provinsi=None, tahun_cari=None) -> dict
+    """
+    teks_gabungan = df_all[kolom_teks].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+
+    def cari(kata_kunci: list = None, provinsi: str = None, tahun_cari: int = None) -> dict:
+        d = df_all
+        teks = teks_gabungan
+        if scope_kdsatker is not None:
+            mask = d["KDSATKER"] == scope_kdsatker
+            d, teks = d[mask], teks[mask]
+        if tahun_cari is not None and "TAHUN" in d.columns:
+            mask = d["TAHUN"] == tahun_cari
+            d, teks = d[mask], teks[mask]
+        if provinsi and "PROVINSI" in d.columns:
+            mask = d["PROVINSI"].str.contains(provinsi, case=False, na=False)
+            d, teks = d[mask], teks[mask]
+        if kata_kunci:
+            mask = pd.Series(False, index=d.index)
+            for kw in kata_kunci:
+                mask = mask | teks.str.contains(str(kw).lower(), na=False)
+            d = d[mask]
+
+        if d.empty:
+            return {
+                "ditemukan": False,
+                "pesan": "Tidak ada baris data yang cocok dengan kata kunci/filter ini.",
+            }
+
+        rincian = (
+            d.groupby(["KDDEPT", "NMDEPT", "KDSATKER", "NMSATKER"])
+            .agg(PAGU=("PAGU", "sum"), REALISASI=("REALISASI", "sum"))
+            .reset_index().sort_values("PAGU", ascending=False).head(30)
+        )
+        rincian["KDSATKER"] = rincian["KDSATKER"].apply(fmt_satker)
+        rincian["KDDEPT"] = rincian["KDDEPT"].apply(fmt_dept)
+
+        return {
+            "ditemukan": True,
+            "jumlah_baris_cocok": int(len(d)),
+            "jumlah_satker_ditemukan": int(rincian.shape[0]),
+            "total_pagu": float(d["PAGU"].sum()),
+            "total_realisasi": float(d["REALISASI"].sum()),
+            "rincian_per_satker_top30": rincian.to_dict(orient="records"),
+            "catatan": (
+                "rincian_per_satker_top30 diurutkan dari pagu terbesar, dibatasi 30 baris teratas."
+                + (" Pencarian dibatasi hanya data satker Anda sendiri." if scope_kdsatker is not None else "")
+            ),
+        }
+
+    return cari
+
+
+def render_ai_section(
+    ringkasan_fn, cari_fn, page_key: str, narasi_variasi_key: str = "",
+    deskripsi_tool: str = (
+        "Mencari & menjumlahkan pagu/realisasi berdasarkan kata kunci tema/program/kegiatan, "
+        "dan opsional filter provinsi atau tahun. WAJIB dipakai untuk pertanyaan yang menyebutkan "
+        "tema, lokasi/provinsi tertentu, atau satker/kementerian yang BUKAN yang sedang aktif."
+    ),
+):
+    """Render bagian 'Narasi Otomatis AI' + chat box tanya-AI (dgn tool-calling pencarian
+    tematik). Dipakai semua halaman (app.py & pages/*.py) supaya seragam.
+
+    ringkasan_fn: callable() -> str, ringkasan konteks data terkini utk system prompt
+    cari_fn: callable(kata_kunci, provinsi=None, tahun_cari=None) -> dict, tool pencarian
+             (lihat buat_cari_generik, atau fungsi custom seperti di app.py)
+    page_key: id unik per halaman (mis. "satker", "prioritas", "strategis", "tkd") --
+              dipakai memisahkan riwayat chat & key widget antar halaman
+    narasi_variasi_key: id tambahan yang berubah kalau filter berubah (mis. tahun/satker)
+              -- dipakai cache narasi supaya tidak nyampur antar filter berbeda
+    """
+    import json as _json
+
+    client = get_groq_client()
+
+    tools_groq = [{
+        "type": "function",
+        "function": {
+            "name": "cari_anggaran",
+            "description": deskripsi_tool,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kata_kunci": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Daftar kata kunci (boleh beberapa sinonim) untuk dicari.",
+                    },
+                    "provinsi": {
+                        "type": "string",
+                        "description": "Nama provinsi untuk filter lokasi (opsional).",
+                    },
+                    "tahun_cari": {
+                        "type": "integer",
+                        "description": "Tahun anggaran (opsional, kosongkan utk pakai tahun yang sedang dipilih).",
+                    },
+                },
+                "required": ["kata_kunci"],
+            },
+        },
+    }]
+
+    def _jalankan_tool_call(nama_fungsi, args):
+        if nama_fungsi == "cari_anggaran":
+            hasil = cari_fn(
+                kata_kunci=args.get("kata_kunci", []),
+                provinsi=args.get("provinsi"),
+                tahun_cari=args.get("tahun_cari"),
+            )
+        else:
+            hasil = {"error": f"Fungsi tidak dikenal: {nama_fungsi}"}
+        return _json.dumps(hasil, ensure_ascii=False)
+
+    # --- Narasi otomatis ---
+    st.subheader("🤖 Narasi Otomatis")
+    if client is None:
+        st.info(
+            "Narasi AI belum aktif. Tambahkan `GROQ_API_KEY` di file `.streamlit/secrets.toml` "
+            "(lihat README.md) untuk mengaktifkan fitur ini."
+        )
+    else:
+        cache_key = f"narasi_{page_key}_{narasi_variasi_key}"
+        if st.button("Buat / Perbarui Narasi", key=f"btn_{cache_key}"):
+            with st.spinner("AI sedang menyusun narasi..."):
+                try:
+                    resp = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Kamu adalah analis anggaran pemerintah Indonesia. Tulis narasi "
+                                    "singkat (1-2 paragraf, bahasa Indonesia formal) yang menjelaskan "
+                                    "kondisi pagu dan realisasi anggaran berikut, termasuk kecukupan "
+                                    "serapan. Jangan mengulang angka mentah berlebihan, fokus insight."
+                                ),
+                            },
+                            {"role": "user", "content": ringkasan_fn()},
+                        ],
+                    )
+                    st.session_state[cache_key] = resp.choices[0].message.content
+                except Exception as e:
+                    st.error(f"Gagal membuat narasi karena gangguan AI ({type(e).__name__}). Coba lagi.")
+
+        if cache_key in st.session_state:
+            st.write(st.session_state[cache_key])
+        else:
+            st.caption("Klik tombol di atas untuk membuat narasi.")
+
+    st.divider()
+
+    # --- Chat box ---
+    chat_state_key = f"chat_history_{page_key}"
+    if chat_state_key not in st.session_state:
+        st.session_state[chat_state_key] = []
+
+    MAKS_HISTORI_DIKIRIM = 6
+
+    col_chat_title, col_chat_reset = st.columns([5, 1])
+    with col_chat_title:
+        st.subheader("💬 Tanya AI tentang Data Ini")
+    with col_chat_reset:
+        if st.button("🗑️ Reset Chat", key=f"resetchat_{page_key}"):
+            st.session_state[chat_state_key] = []
+            st.rerun()
+
+    st.caption(
+        "Bisa tanya soal data yang sedang ditampilkan, atau tema/lokasi lain -- AI otomatis "
+        "mencari di data yang tersedia di halaman ini kalau perlu."
+    )
+
+    for msg in st.session_state[chat_state_key]:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    prompt = st.chat_input("Tulis pertanyaan tentang data ini...", key=f"chatinput_{page_key}")
+
+    if prompt:
+        st.session_state[chat_state_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        if client is None:
+            jawaban = "Fitur chat AI belum aktif karena GROQ_API_KEY belum di-set. Lihat README.md."
+        else:
+            with st.spinner("AI sedang menjawab..."):
+                system_msg = {
+                    "role": "system",
+                    "content": (
+                        "Kamu adalah asisten analisis anggaran pemerintah Indonesia. Untuk "
+                        "pertanyaan tentang data yang SEDANG ditampilkan, jawab langsung memakai "
+                        "data di bawah ini. Untuk pertanyaan tentang tema/lokasi/entitas LAIN, "
+                        "WAJIB panggil fungsi cari_anggaran -- jangan mengarang angka. Kalau hasil "
+                        "pencarian menyatakan tidak ditemukan, katakan jujur, jangan mengarang.\n\n"
+                        + ringkasan_fn()
+                    ),
+                }
+                histori_dikirim = st.session_state[chat_state_key][-MAKS_HISTORI_DIKIRIM:]
+                messages = [system_msg] + histori_dikirim
+
+                jawaban = None
+                try:
+                    resp = client.chat.completions.create(
+                        model=GROQ_MODEL, messages=messages, tools=tools_groq, tool_choice="auto",
+                    )
+                    msg = resp.choices[0].message
+
+                    if msg.tool_calls:
+                        messages.append({
+                            "role": "assistant",
+                            "content": msg.content or "",
+                            "tool_calls": [
+                                {
+                                    "id": tc.id, "type": "function",
+                                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                                }
+                                for tc in msg.tool_calls
+                            ],
+                        })
+                        for tc in msg.tool_calls:
+                            try:
+                                args = _json.loads(tc.function.arguments)
+                            except Exception:
+                                args = {}
+                            hasil_tool = _jalankan_tool_call(tc.function.name, args)
+                            messages.append({"role": "tool", "tool_call_id": tc.id, "content": hasil_tool})
+                        resp2 = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+                        jawaban = resp2.choices[0].message.content
+                    else:
+                        jawaban = msg.content
+                except Exception as e:
+                    detail = getattr(e, "message", None) or str(e)
+                    body = getattr(e, "body", None)
+                    jawaban = f"⚠️ Gagal memanggil Groq API: {detail}"
+                    with st.expander("Detail error (untuk debugging)"):
+                        st.code(f"{type(e).__name__}: {detail}\n\nBody: {body}")
+
+        st.session_state[chat_state_key].append({"role": "assistant", "content": jawaban})
+        with st.chat_message("assistant"):
+            st.write(jawaban)
+
+
 # --------------------------------------------------------------------------
 # Dashboard generik utk data "kategori" (Prioritas Presiden / Program Strategis) --
 # Halaman 2 & 3 sama-sama memanggil ini karena struktur sumber datanya identik, cuma
@@ -418,21 +677,35 @@ def _load_csv_kategori(path: str) -> pd.DataFrame:
     return d
 
 
-def render_dashboard_kategori(data_path: str, judul_halaman: str, icon: str, label_kategori: str):
-    """Render dashboard lengkap (filter, KPI, grafik, tabel rincian) untuk data prioritas/
-    strategis. Dipanggil oleh pages/2_*.py (Prioritas Presiden) & pages/3_*.py (Program
-    Strategis) dengan parameter berbeda.
+def render_dashboard_kategori(
+    data_path: str, judul_halaman: str, icon: str, label_kategori: str,
+    scope_kdsatker: int = None, page_key: str = None,
+):
+    """Render dashboard lengkap (filter, KPI, grafik, tabel rincian, AI) untuk data
+    prioritas/strategis. Dipanggil oleh pages/2_*.py (Prioritas Presiden) & pages/3_*.py
+    (Program Strategis) dengan parameter berbeda.
 
     data_path: path file CSV (gzip) hasil olahan build_prioritas_strategis.py
     judul_halaman: judul ditampilkan di halaman, mis. "Dashboard Prioritas Presiden"
     icon: emoji ikon halaman
     label_kategori: nama kolom kategori utk ditampilkan di UI, mis. "Prioritas Presiden"
+    scope_kdsatker: kalau diisi (user satker biasa), data dibatasi ke satker ini saja
+    page_key: id unik halaman utk AI chat/narasi (default: label_kategori disederhanakan)
     """
     if not os.path.exists(data_path):
         st.warning(f"Halaman ini belum aktif -- file data belum tersedia di `{data_path}`.")
         st.stop()
 
     df = _load_csv_kategori(data_path)
+    if scope_kdsatker is not None:
+        df = df[df["KDSATKER"] == scope_kdsatker]
+        if df.empty:
+            st.info(
+                f"Satker Anda tidak memiliki anggaran terkait {label_kategori.lower()}."
+            )
+            st.stop()
+
+    page_key = page_key or label_kategori.lower().replace(" ", "_")
 
     # --- Sidebar filter ---
     st.sidebar.header("Filter")
@@ -643,4 +916,35 @@ def render_dashboard_kategori(data_path: str, judul_halaman: str, icon: str, lab
     st.caption(
         "Tabel ini menampilkan rincian tiap baris kegiatan/output/suboutput yang termasuk "
         f"{label_kategori.lower()}, diurutkan dari pagu terbesar."
+    )
+
+    st.divider()
+
+    # --- AI: narasi otomatis + chat pencarian tematik ---
+    def _ringkasan():
+        cakupan = f" (khusus satker Anda)" if scope_kdsatker is not None else ""
+        return f"""
+Data {label_kategori}{cakupan}:
+- Cakupan: {kategori or f'Semua {label_kategori}'}
+- Tahun: {tahun}
+- Pagu: Rp {pagu_total:,.0f}
+- Realisasi: Rp {realisasi_total:,.0f} ({persen_serapan:.1f}% dari pagu)
+- Sisa pagu: Rp {sisa_pagu:,.0f}
+- Proyeksi realisasi akhir tahun: Rp {proyeksi_akhir_tahun:,.0f} ({persen_proyeksi:.1f}% dari pagu)
+""".strip()
+
+    cari_fn = buat_cari_generik(
+        df, ["NMDEPT", "NMSATKER", "KABKOTA", "KEGIATAN", "OUTPUT", "SUBOUTPUT", "AKUN", "KATEGORI"],
+        scope_kdsatker=scope_kdsatker,
+    )
+
+    render_ai_section(
+        _ringkasan, cari_fn, page_key=page_key,
+        narasi_variasi_key=f"{tahun}_{kategori}_{scope_kdsatker}",
+        deskripsi_tool=(
+            f"Mencari & menjumlahkan pagu/realisasi {label_kategori} berdasarkan kata kunci "
+            "(nama satker/kegiatan/output/suboutput/akun/kategori), dan opsional filter provinsi "
+            "atau tahun. WAJIB dipakai untuk pertanyaan yang menyebutkan tema/kegiatan atau "
+            "satker tertentu yang BUKAN cakupan yang sedang aktif."
+        ),
     )
