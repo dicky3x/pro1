@@ -18,7 +18,7 @@ from common import (
     BULAN_KOLOM, BULAN_LABEL, fmt_satker, fmt_dept,
     get_data, tanggal_update_data, kpi_card,
     hitung_proyeksi_agregat, hitung_proyeksi_per_kategori, isi_tabel_proyeksi,
-    hitung_bulan_penuh_terakhir, buat_cari_generik, render_ai_section,
+    hitung_bulan_penuh_terakhir, buat_cari_generik, render_ai_section, render_dataset_upload_qa,
 )
 
 df = get_data()
@@ -559,3 +559,7 @@ render_ai_section(
     narasi_variasi_key=f"{tahun}_{kddept}_{kdsatker}",
     deskripsi_tool=_deskripsi_tool,
 )
+
+if is_super:
+    st.divider()
+    render_dataset_upload_qa(page_key="upload_satker")

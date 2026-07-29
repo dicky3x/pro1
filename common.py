@@ -840,59 +840,6 @@ def render_dashboard_kategori(
         )
         st.divider()
 
-    # --- Trend chart ---
-    st.subheader("Tren & Proyeksi Realisasi hingga Akhir Tahun")
-    bulan_angka = list(range(1, 13))
-
-    def _nilai_proyeksi_bulan(b):
-        if proyeksi_agregat_bulanan is not None:
-            return proyeksi_agregat_bulanan[b - 1]
-        return rerata_bulanan
-
-    aktual = [monthly.values[b - 1] if b <= bulan_penuh_terakhir else None for b in bulan_angka]
-    proyeksi = []
-    for b in bulan_angka:
-        if bulan_penuh_terakhir == 0:
-            proyeksi.append(_nilai_proyeksi_bulan(b))
-        elif b < bulan_penuh_terakhir:
-            proyeksi.append(None)
-        elif b == bulan_penuh_terakhir:
-            proyeksi.append(monthly.values[b - 1])
-        else:
-            proyeksi.append(_nilai_proyeksi_bulan(b))
-
-    fig_trend = go.Figure()
-    fig_trend.add_trace(go.Scatter(
-        x=BULAN_KOLOM, y=aktual, mode="lines+markers", name="Realisasi per Bulan (Aktual)",
-        line=dict(width=3, shape="spline", smoothing=1.1),
-    ))
-    fig_trend.add_trace(go.Scatter(
-        x=BULAN_KOLOM, y=proyeksi, mode="lines+markers", name="Proyeksi (rata-rata bulanan)",
-        line=dict(dash="dash", shape="spline", smoothing=1.1),
-    ))
-    fig_trend.update_layout(yaxis_title="Rupiah (per bulan)", xaxis_title=None)
-    st.plotly_chart(fig_trend, use_container_width=True)
-
-    _label_batas = BULAN_LABEL.get(bulan_penuh_terakhir, "-") if bulan_penuh_terakhir else None
-    _batas_teks = f"Bulan setelah {_label_batas}" if _label_batas else "Seluruh bulan tahun ini"
-
-    if metode_proyeksi == "historis":
-        daftar_tahun_ket = ", ".join(str(t) for t in tahun_dipakai)
-        st.caption(
-            f"Grafik ini menampilkan realisasi tiap bulan (bukan kumulatif). {_batas_teks} "
-            "adalah proyeksi yang dihitung dari rerata tertimbang tingkat realisasi tahun-tahun "
-            f"sebelumnya dikalikan pagu tahun {tahun}. Tahun historis yang dipakai: {daftar_tahun_ket}."
-        )
-    else:
-        st.caption(
-            f"Grafik ini menampilkan realisasi tiap bulan (bukan kumulatif). {_batas_teks} "
-            f"adalah proyeksi. Data {label_kategori} baru tersedia untuk tahun {tahun} saja "
-            "(belum ada histori tahun sebelumnya di file sumber ini), sehingga proyeksi memakai "
-            "metode cadangan: rata-rata realisasi per bulan pada tahun berjalan dikalikan 12 bulan."
-        )
-
-    st.divider()
-
     # --- Tabel rincian kegiatan/output/suboutput ---
     st.markdown(f"**Rincian {label_kategori}**")
     kolom_tampil = [
@@ -948,3 +895,253 @@ Data {label_kategori}{cakupan}:
             "satker tertentu yang BUKAN cakupan yang sedang aktif."
         ),
     )
+
+
+# --------------------------------------------------------------------------
+# Upload dataset bebas (khusus super user) + tanya-AI tentang dataset itu.
+# Beda dengan render_ai_section (yang pencariannya sudah tahu skema data anggaran),
+# di sini datanya BEBAS (struktur apa saja dari file yang diupload), jadi AI diberi tool
+# "analisis_dataset" yang aman: filter pakai sintaks pandas .query() (bukan eval bebas)
+# + agregasi (sum/mean/count/dll), bukan eksekusi kode Python sembarangan.
+# --------------------------------------------------------------------------
+
+def _analisis_dataset_builder(df_upload: pd.DataFrame):
+    FUNGSI_VALID = {"sum", "mean", "count", "min", "max", "median", "std", "nunique"}
+
+    def analisis_dataset(query_filter: str = None, groupby_kolom: list = None,
+                          agg_kolom: str = None, agg_fungsi: str = "sum", limit: int = 20) -> dict:
+        d = df_upload
+        if query_filter:
+            try:
+                d = d.query(query_filter)
+            except Exception as e:
+                return {
+                    "error": (
+                        f"Filter tidak valid: {e}. Gunakan sintaks pandas query, mis. "
+                        "\"kolom_a > 100 and kolom_b == 'X'\". Nama kolom yang mengandung spasi "
+                        "harus dibungkus backtick, mis. `nama kolom`."
+                    )
+                }
+
+        if d.empty:
+            return {"ditemukan": False, "pesan": "Tidak ada baris yang cocok dengan filter ini."}
+
+        hasil = {"jumlah_baris_cocok": int(len(d))}
+        fn = agg_fungsi if agg_fungsi in FUNGSI_VALID else "sum"
+
+        if agg_kolom and agg_kolom not in d.columns:
+            return {"error": f"Kolom '{agg_kolom}' tidak ada di dataset. Kolom tersedia: {list(df_upload.columns)}"}
+
+        try:
+            if groupby_kolom and agg_kolom:
+                agg_df = d.groupby(groupby_kolom)[agg_kolom].agg(fn).reset_index()
+                agg_df = agg_df.sort_values(agg_kolom, ascending=False).head(limit)
+                hasil["hasil_agregasi"] = agg_df.to_dict(orient="records")
+            elif agg_kolom:
+                nilai = getattr(d[agg_kolom], fn)()
+                try:
+                    hasil["hasil"] = float(nilai)
+                except (TypeError, ValueError):
+                    hasil["hasil"] = str(nilai)
+            else:
+                hasil["contoh_baris"] = d.head(limit).to_dict(orient="records")
+        except Exception as e:
+            hasil["error_agregasi"] = str(e)
+
+        return hasil
+
+    return analisis_dataset
+
+
+def render_dataset_upload_qa(page_key: str = "upload_dataset"):
+    """Fitur upload dataset (CSV/XLSX) bebas + tanya-AI tentang isinya. HANYA dipanggil
+    untuk super user (lihat pemanggilannya di view_dashboard_satker.py)."""
+    st.subheader("📁 Upload Dataset Tambahan (Super User)")
+    st.caption(
+        "Upload file CSV atau Excel apa saja, lalu tanya AI tentang isinya di chat box "
+        "di bawah. Fitur ini terpisah dari data anggaran utama."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload file CSV atau Excel", type=["csv", "xlsx", "xls"], key=f"uploader_{page_key}"
+    )
+
+    if uploaded_file is None:
+        st.caption("Belum ada file yang diupload.")
+        return
+
+    try:
+        if uploaded_file.name.lower().endswith((".xlsx", ".xls")):
+            df_upload = pd.read_excel(uploaded_file)
+        else:
+            df_upload = pd.read_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"Gagal membaca file: {e}")
+        return
+
+    if df_upload.empty:
+        st.warning("File berhasil dibaca tapi tidak ada baris data.")
+        return
+
+    st.success(f"Berhasil memuat **{len(df_upload):,} baris** x **{len(df_upload.columns)} kolom**.")
+    with st.expander("Pratinjau data (20 baris pertama)", expanded=False):
+        st.dataframe(df_upload.head(20), use_container_width=True)
+        st.caption("Tipe data per kolom: " + ", ".join(f"{c} ({df_upload[c].dtype})" for c in df_upload.columns))
+
+    def _ringkasan():
+        kolom_info = "\n".join(f"- {c} ({df_upload[c].dtype})" for c in df_upload.columns)
+        contoh = df_upload.head(5).to_dict(orient="records")
+        return f"""
+Dataset yang diupload user ("{uploaded_file.name}"):
+- Jumlah baris: {len(df_upload):,}
+- Jumlah kolom: {len(df_upload.columns)}
+- Daftar kolom & tipe data:
+{kolom_info}
+- Contoh 5 baris pertama (JSON): {contoh}
+""".strip()
+
+    analisis_fn = _analisis_dataset_builder(df_upload)
+
+    # render_ai_section dibuat generik utk tool "cari_anggaran" (dataset anggaran); di sini
+    # kita pakai instance terpisah dengan tool "analisis_dataset" -- jadi bagian narasi/chat
+    # ditulis ulang secara ringkas khusus utk dataset upload (skema tool beda).
+    _render_chat_dataset_upload(_ringkasan, analisis_fn, page_key, list(df_upload.columns))
+
+
+def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar_kolom: list):
+    import json as _json
+
+    client = get_groq_client()
+
+    tools_groq = [{
+        "type": "function",
+        "function": {
+            "name": "analisis_dataset",
+            "description": (
+                "Memfilter, mengelompokkan, dan menghitung agregasi (sum/mean/count/min/max/dll) "
+                "pada dataset yang diupload user. WAJIB dipakai untuk menjawab pertanyaan spesifik "
+                "tentang angka/jumlah/rata-rata di data ini -- jangan mengarang dari ingatan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query_filter": {
+                        "type": "string",
+                        "description": (
+                            "Filter dengan sintaks pandas query (opsional), mis. "
+                            "\"umur > 30 and kota == 'Jakarta'\". Kosongkan utk semua baris. "
+                            f"Kolom tersedia: {daftar_kolom}"
+                        ),
+                    },
+                    "groupby_kolom": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Kolom utk dikelompokkan (opsional).",
+                    },
+                    "agg_kolom": {"type": "string", "description": "Kolom yang mau dihitung/diagregasi (opsional)."},
+                    "agg_fungsi": {
+                        "type": "string",
+                        "enum": ["sum", "mean", "count", "min", "max", "median", "std", "nunique"],
+                        "description": "Fungsi agregasi, default 'sum'.",
+                    },
+                    "limit": {"type": "integer", "description": "Batas baris hasil ditampilkan, default 20."},
+                },
+                "required": [],
+            },
+        },
+    }]
+
+    def _jalankan_tool_call(nama_fungsi, args):
+        if nama_fungsi == "analisis_dataset":
+            hasil = analisis_fn(
+                query_filter=args.get("query_filter"),
+                groupby_kolom=args.get("groupby_kolom"),
+                agg_kolom=args.get("agg_kolom"),
+                agg_fungsi=args.get("agg_fungsi", "sum"),
+                limit=args.get("limit", 20),
+            )
+        else:
+            hasil = {"error": f"Fungsi tidak dikenal: {nama_fungsi}"}
+        return _json.dumps(hasil, ensure_ascii=False, default=str)
+
+    if client is None:
+        st.info(
+            "Chat AI belum aktif. Tambahkan `GROQ_API_KEY` di file `.streamlit/secrets.toml` "
+            "(lihat README.md) untuk mengaktifkan fitur ini."
+        )
+        return
+
+    chat_state_key = f"chat_history_{page_key}"
+    if chat_state_key not in st.session_state:
+        st.session_state[chat_state_key] = []
+
+    MAKS_HISTORI_DIKIRIM = 6
+
+    col_title, col_reset = st.columns([5, 1])
+    with col_title:
+        st.markdown("**💬 Tanya AI tentang Dataset Ini**")
+    with col_reset:
+        if st.button("🗑️ Reset Chat", key=f"resetchat_{page_key}"):
+            st.session_state[chat_state_key] = []
+            st.rerun()
+
+    for msg in st.session_state[chat_state_key]:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    prompt = st.chat_input("Tulis pertanyaan tentang dataset yang diupload...", key=f"chatinput_{page_key}")
+
+    if prompt:
+        st.session_state[chat_state_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        with st.spinner("AI sedang menjawab..."):
+            system_msg = {
+                "role": "system",
+                "content": (
+                    "Kamu adalah asisten analisis data. Jawab pertanyaan user tentang dataset yang "
+                    "diupload memakai tool analisis_dataset -- jangan mengarang angka. Kalau filter "
+                    "gagal atau kolom tidak ada, jelaskan errornya ke user dengan jujur dan sarankan "
+                    "perbaikan (mis. nama kolom yang benar).\n\n" + ringkasan_fn()
+                ),
+            }
+            histori_dikirim = st.session_state[chat_state_key][-MAKS_HISTORI_DIKIRIM:]
+            messages = [system_msg] + histori_dikirim
+
+            jawaban = None
+            try:
+                resp = client.chat.completions.create(
+                    model=GROQ_MODEL, messages=messages, tools=tools_groq, tool_choice="auto",
+                )
+                msg = resp.choices[0].message
+
+                if msg.tool_calls:
+                    messages.append({
+                        "role": "assistant",
+                        "content": msg.content or "",
+                        "tool_calls": [
+                            {
+                                "id": tc.id, "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                            }
+                            for tc in msg.tool_calls
+                        ],
+                    })
+                    for tc in msg.tool_calls:
+                        try:
+                            args = _json.loads(tc.function.arguments)
+                        except Exception:
+                            args = {}
+                        hasil_tool = _jalankan_tool_call(tc.function.name, args)
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": hasil_tool})
+                    resp2 = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+                    jawaban = resp2.choices[0].message.content
+                else:
+                    jawaban = msg.content
+            except Exception as e:
+                detail = getattr(e, "message", None) or str(e)
+                jawaban = f"⚠️ Gagal memanggil Groq API: {detail}"
+
+        st.session_state[chat_state_key].append({"role": "assistant", "content": jawaban})
+        with st.chat_message("assistant"):
+            st.write(jawaban)
