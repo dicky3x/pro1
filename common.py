@@ -506,12 +506,12 @@ def render_ai_section(
                         "description": "Daftar kata kunci (boleh beberapa sinonim) untuk dicari.",
                     },
                     "provinsi": {
-                        "type": "string",
-                        "description": "Nama provinsi untuk filter lokasi (opsional).",
+                        "type": ["string", "null"],
+                        "description": "Nama provinsi untuk filter lokasi (opsional, boleh null).",
                     },
                     "tahun_cari": {
-                        "type": "integer",
-                        "description": "Tahun anggaran (opsional, kosongkan utk pakai tahun yang sedang dipilih).",
+                        "type": ["integer", "null"],
+                        "description": "Tahun anggaran (opsional, boleh null utk pakai tahun yang sedang dipilih).",
                     },
                 },
                 "required": ["kata_kunci"],
@@ -1026,24 +1026,30 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
                 "type": "object",
                 "properties": {
                     "query_filter": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": (
-                            "Filter dengan sintaks pandas query (opsional), mis. "
-                            "\"umur > 30 and kota == 'Jakarta'\". Kosongkan utk semua baris. "
+                            "Filter dengan sintaks pandas query (opsional, boleh null), mis. "
+                            "\"umur > 30 and kota == 'Jakarta'\". Kosongkan/null utk semua baris. "
                             f"Kolom tersedia: {daftar_kolom}"
                         ),
                     },
                     "groupby_kolom": {
-                        "type": "array", "items": {"type": "string"},
-                        "description": "Kolom utk dikelompokkan (opsional).",
+                        "type": ["array", "null"], "items": {"type": "string"},
+                        "description": "Kolom utk dikelompokkan (opsional, boleh null).",
                     },
-                    "agg_kolom": {"type": "string", "description": "Kolom yang mau dihitung/diagregasi (opsional)."},
+                    "agg_kolom": {
+                        "type": ["string", "null"],
+                        "description": "Kolom yang mau dihitung/diagregasi (opsional, boleh null).",
+                    },
                     "agg_fungsi": {
-                        "type": "string",
-                        "enum": ["sum", "mean", "count", "min", "max", "median", "std", "nunique"],
+                        "type": ["string", "null"],
+                        "enum": ["sum", "mean", "count", "min", "max", "median", "std", "nunique", None],
                         "description": "Fungsi agregasi, default 'sum'.",
                     },
-                    "limit": {"type": "integer", "description": "Batas baris hasil ditampilkan, default 20."},
+                    "limit": {
+                        "type": ["integer", "null"],
+                        "description": "Batas baris hasil ditampilkan, default 20.",
+                    },
                 },
                 "required": [],
             },
@@ -1056,8 +1062,8 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
                 query_filter=args.get("query_filter"),
                 groupby_kolom=args.get("groupby_kolom"),
                 agg_kolom=args.get("agg_kolom"),
-                agg_fungsi=args.get("agg_fungsi", "sum"),
-                limit=args.get("limit", 20),
+                agg_fungsi=args.get("agg_fungsi") or "sum",
+                limit=args.get("limit") or 20,
             )
         else:
             hasil = {"error": f"Fungsi tidak dikenal: {nama_fungsi}"}
