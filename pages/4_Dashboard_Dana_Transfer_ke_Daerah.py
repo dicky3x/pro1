@@ -21,7 +21,7 @@ import streamlit as st
 from common import (
     BULAN_KOLOM, get_data, tanggal_update_data, kpi_card,
     hitung_proyeksi_agregat, hitung_bulan_penuh_terakhir, KODE_JENIS_TKD,
-    buat_cari_generik, render_ai_section,
+    buat_cari_generik, render_ai_section, render_disclaimer,
 )
 import numpy as np
 
@@ -118,6 +118,7 @@ persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
 st.title("🏘️ Dashboard Dana Transfer ke Daerah (TKD)")
 st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data()}")
 st.caption(f"{kabkota or 'Semua Kabupaten/Kota'} — Tahun {tahun}")
+render_disclaimer()
 
 r1c1, r1c2 = st.columns(2)
 r2c1, r2c2 = st.columns(2)
