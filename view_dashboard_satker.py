@@ -19,6 +19,7 @@ from common import (
     get_data, tanggal_update_data, kpi_card,
     hitung_proyeksi_agregat, hitung_proyeksi_per_kategori, isi_tabel_proyeksi,
     hitung_bulan_penuh_terakhir, buat_cari_generik, render_ai_section, render_dataset_upload_qa,
+    render_disclaimer, LABEL_BELANJA_PEGAWAI,
 )
 
 df = get_data()
@@ -161,6 +162,7 @@ persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
 st.title("📊 Dashboard Pagu & Realisasi Satker")
 st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data()}")
 st.caption(f"{nmdept} — {nmsatker} — Tahun {tahun}")
+render_disclaimer()
 
 r1c1, r1c2 = st.columns(2)
 r2c1, r2c2 = st.columns(2)
@@ -347,11 +349,12 @@ proyeksi_per_jenis, _ = hitung_proyeksi_per_kategori(
 
 # Data tampilan per bulan: realisasi aktual utk bulan yang sudah penuh, proyeksi utk bulan
 # yang belum berakhir/belum terjadi (memakai bulan_penuh_terakhir, sama seperti grafik tren).
-# Proyeksi selain Belanja Pegawai otomatis dibatasi maks 100% dari pagu -- lihat
-# common.py::isi_tabel_proyeksi utk penjelasan lengkap cara hitungnya.
+# Belanja Pegawai (51) pakai rumus proyeksi berbeda & TIDAK dibatasi maks pagu (lihat
+# common.py::_hitung_proyeksi_belanja_pegawai); jenis belanja lain otomatis dibatasi maks
+# 100% dari pagu -- lihat common.py::isi_tabel_proyeksi utk penjelasan lengkap cara hitungnya.
 tabel_tampil = isi_tabel_proyeksi(
     realisasi_aktual_jenis, proyeksi_per_jenis, pagu_per_jenis, bulan_penuh_terakhir,
-    kategori_dikecualikan_cap="Belanja Pegawai",
+    kategori_dikecualikan_cap=LABEL_BELANJA_PEGAWAI,
 )
 
 # --- Transpose: baris = bulan, kolom = jenis belanja, + kolom TOTAL di kanan ---
@@ -436,12 +439,16 @@ st.dataframe(styled_tabel, use_container_width=True)
 st.caption(
     "🟨 Sel berwarna kuning = mengandung angka proyeksi (bulan yang belum berakhir), dihitung "
     "dari rerata tertimbang tingkat realisasi jenis belanja ini pada tahun-tahun sebelumnya "
-    "(lihat penjelasan di atas grafik tren) dikalikan pagu jenis belanja tahun berjalan. Jika "
-    "suatu jenis belanja belum punya histori, dipakai rata-rata realisasi tahun berjalan sebagai "
-    "cadangan. Baris \"Total Realisasi\" hanya menjumlahkan uang yang sudah benar-benar "
-    "terealisasi (bulan penuh saja), sedangkan baris \"Total Realisasi + Proyeksi Akhir Tahun\" "
-    "menjumlahkan realisasi ditambah estimasi bulan-bulan yang belum berakhir/belum terjadi. "
-    "Kolom PAGU & baris PAGU tidak ditandai kuning karena berupa acuan, bukan proyeksi."
+    "(lihat penjelasan di atas grafik tren) dikalikan pagu jenis belanja tahun berjalan. Khusus "
+    f"**{LABEL_BELANJA_PEGAWAI}**, proyeksi dihitung dari rerata tertimbang REALISASI bulanan "
+    "tahun-tahun sebelumnya secara langsung (bobot 50%-25%-12,5%-6,25%-6,25% untuk y-1 s.d. "
+    f"y-5), TANPA dibatasi maksimal pagu tahun berjalan -- karena realisasi {LABEL_BELANJA_PEGAWAI} "
+    "bisa saja melebihi pagu saat ini. Jika suatu jenis belanja belum punya histori, dipakai "
+    "rata-rata realisasi tahun berjalan sebagai cadangan. Baris \"Total Realisasi\" hanya "
+    "menjumlahkan uang yang sudah benar-benar terealisasi (bulan penuh saja), sedangkan baris "
+    "\"Total Realisasi + Proyeksi Akhir Tahun\" menjumlahkan realisasi ditambah estimasi "
+    "bulan-bulan yang belum berakhir/belum terjadi. Kolom PAGU & baris PAGU tidak ditandai "
+    "kuning karena berupa acuan, bukan proyeksi."
 )
 
 st.divider()

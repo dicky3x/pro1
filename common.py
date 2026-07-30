@@ -45,6 +45,11 @@ LABEL_JENIS_BELANJA_SINGKAT = {
 # Kode jenis belanja yang termasuk kategori Transfer ke Daerah (dipakai Halaman 3).
 KODE_JENIS_TKD = [61, 62, 63, 64, 65, 66]
 
+# Label jenis belanja 51 (Belanja Pegawai) -- dipakai di beberapa tempat karena kategori ini
+# punya perlakuan khusus: rumus proyeksi berbeda & TIDAK dibatasi maksimal pagu (lihat
+# hitung_proyeksi_per_kategori & isi_tabel_proyeksi).
+LABEL_BELANJA_PEGAWAI = LABEL_JENIS_BELANJA_SINGKAT[51]
+
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # openai/gpt-oss-120b kadang tidak stabil untuk tool/function calling di Groq (error
 # "tool_use_failed" / 400 BadRequestError sudah dilaporkan komunitas Groq). Kalau panggilan
@@ -208,6 +213,14 @@ def require_login(df_all: pd.DataFrame, judul_halaman: str = "Dashboard"):
         st.session_state.auth = None
 
     if st.session_state.auth is None:
+        # Saat belum login, app.py berhenti (st.stop()) SEBELUM sempat memanggil
+        # st.navigation(pages) -- akibatnya Streamlit menampilkan navigasi bawaan
+        # (daftar nama file di folder pages/) di sidebar. CSS ini menyembunyikan
+        # navigasi bawaan itu supaya sidebar bersih selama di layar login.
+        st.markdown(
+            "<style>[data-testid='stSidebarNav'] {display: none;}</style>",
+            unsafe_allow_html=True,
+        )
         st.title(f"🔐 Login {judul_halaman}")
         st.caption(
             "Login memakai kode satker Anda sebagai username maupun password. Setelah login, "
@@ -278,15 +291,61 @@ def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, f
     return (total_rate / total_bobot) * pagu_y, tahun_dipakai
 
 
+def _hitung_proyeksi_belanja_pegawai(
+    df_all: pd.DataFrame, tahun_y: int, filter_dict: dict, kolom_kategori: str, label,
+):
+    """Proyeksi 12 bulan KHUSUS Belanja Pegawai (jenis belanja 51).
+
+    Beda dengan kategori lain: rumusnya rerata tertimbang dari REALISASI bulanan tahun-tahun
+    sebelumnya secara LANGSUNG (bukan tingkat realisasi (%) dikalikan pagu tahun berjalan):
+
+        proyeksi_bulan_m = (realisasi_bulan_m tahun y-1 * 50%) + (y-2 * 25%) + (y-3 * 12,5%)
+                            + (y-4 * 6,25%) + (y-5 * 6,25%)
+
+    Ini sengaja tidak diskalakan ke pagu tahun berjalan (pagu_y) supaya proyeksi belanja
+    pegawai boleh lebih besar dari pagu saat ini (mis. karena kenaikan gaji/tunjangan),
+    dan memang TIDAK dibatasi maksimal pagu -- lihat isi_tabel_proyeksi
+    (kategori_dikecualikan_cap). Kalau suatu tahun histori tidak ada datanya, bobot tahun itu
+    diabaikan & sisa bobot yang tersedia dinormalisasi (supaya tetap jadi rerata tertimbang),
+    sama seperti perlakuan kategori lain saat histori tidak lengkap.
+    """
+    total_weighted = np.zeros(12)
+    total_bobot = 0.0
+    tahun_dipakai = []
+    for i in range(1, 6):
+        d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+        d_prev = d_prev[d_prev[kolom_kategori] == label]
+        if d_prev.empty:
+            continue
+        monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+        total_weighted += BOBOT_TAHUN[i] * monthly_prev
+        total_bobot += BOBOT_TAHUN[i]
+        tahun_dipakai.append(tahun_y - i)
+    if total_bobot == 0:
+        return None, tahun_dipakai
+    return total_weighted / total_bobot, tahun_dipakai
+
+
 def hitung_proyeksi_per_kategori(
     df_all: pd.DataFrame, tahun_y: int, pagu_per_kategori_now: pd.Series,
     filter_dict: dict, kolom_kategori: str,
 ):
     """Proyeksi 12 bulan (rupiah) per kategori (jenis belanja ATAU jenis transfer).
-    Return dict label -> array(12) atau None (kalau tidak ada histori)."""
+    Return dict label -> array(12) atau None (kalau tidak ada histori).
+
+    Kategori Belanja Pegawai (LABEL_BELANJA_PEGAWAI) pakai rumus berbeda -- lihat
+    _hitung_proyeksi_belanja_pegawai -- karena proyeksinya boleh melebihi pagu tahun berjalan."""
     hasil = {}
     tahun_dipakai_semua = set()
     for label, pagu_now in pagu_per_kategori_now.items():
+        if kolom_kategori == "LABEL_JENIS_BELANJA" and label == LABEL_BELANJA_PEGAWAI:
+            proyeksi_label, tahun_dipakai_label = _hitung_proyeksi_belanja_pegawai(
+                df_all, tahun_y, filter_dict, kolom_kategori, label
+            )
+            hasil[label] = proyeksi_label
+            tahun_dipakai_semua.update(tahun_dipakai_label)
+            continue
+
         total_rate = np.zeros(12)
         total_bobot = 0.0
         for i in range(1, 6):
@@ -305,7 +364,7 @@ def hitung_proyeksi_per_kategori(
 
 def isi_tabel_proyeksi(
     tabel_aktual: pd.DataFrame, proyeksi_per_kategori: dict, pagu_per_kategori: pd.Series,
-    bulan_penuh_terakhir: int, kategori_dikecualikan_cap: str = "Belanja Pegawai",
+    bulan_penuh_terakhir: int, kategori_dikecualikan_cap: str = LABEL_BELANJA_PEGAWAI,
 ) -> pd.DataFrame:
     """Isi bulan-bulan setelah bulan_penuh_terakhir dengan proyeksi (bukan double-count -- lihat
     catatan di app.py), lalu cap total (aktual+proyeksi) maksimal 100% pagu utk kategori selain
@@ -398,6 +457,20 @@ def kpi_card(label: str, value: str, delta: str = None):
         """,
         unsafe_allow_html=True,
     )
+
+
+DISCLAIMER_TEKS = (
+    "ℹ️ **Disclaimer**: data ini ditarik manual secara berkala melalui sintesa.kemenkeu.go.id "
+    "kewenangan Kanwil DJPb Riau. Beberapa program strategis dan prioritas presiden di Riau "
+    "mungkin tidak muncul di dashboard ini. Hal ini kemungkinan dikarenakan program strategis "
+    "dan prioritas presiden tersebut didanai secara terpusat, tidak dibayarkan melalui KPPN di "
+    "wilayah Riau."
+)
+
+
+def render_disclaimer():
+    """Disclaimer standar yang tampil di setiap halaman dashboard (Halaman 1-4)."""
+    st.caption(DISCLAIMER_TEKS)
 
 
 def satker_ada_di_path(data_path: str, kdsatker: int) -> bool:
@@ -751,6 +824,7 @@ def render_dashboard_kategori(
     st.title(f"{icon} {judul_halaman}")
     st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data(data_path)}")
     st.caption(f"{kategori or f'Semua {label_kategori}'} — Tahun {tahun}")
+    render_disclaimer()
 
     r1c1, r1c2 = st.columns(2)
     r2c1, r2c2 = st.columns(2)
@@ -953,6 +1027,57 @@ def _analisis_dataset_builder(df_upload: pd.DataFrame):
     return analisis_dataset
 
 
+def _baca_file_upload(uploaded_file):
+    """Baca file upload (CSV/XLSX/XLS) dengan beberapa lapis fallback, & pesan error yang
+    jelas kalau gagal. Return (df, catatan) -- catatan berisi peringatan (str) atau None."""
+    nama = uploaded_file.name.lower()
+
+    if nama.endswith((".xlsx", ".xls")):
+        engine = "openpyxl" if nama.endswith(".xlsx") else None
+        try:
+            return pd.read_excel(uploaded_file, engine=engine), None
+        except ImportError as e:
+            paket = "openpyxl" if nama.endswith(".xlsx") else "xlrd"
+            raise RuntimeError(
+                f"Server belum punya paket Python `{paket}` yang dibutuhkan untuk membaca file "
+                f"Excel (.{nama.rsplit('.', 1)[-1]}). Tambahkan baris `{paket}` ke file "
+                "`requirements.txt` di repo GitHub aplikasi ini, lalu deploy ulang. "
+                f"(Detail teknis: {e})"
+            ) from e
+
+    # CSV -- coba beberapa strategi berurutan, dari yang paling standar ke yang paling toleran,
+    # supaya lebih tahan terhadap file yang delimiter-nya bukan koma atau ada baris yang
+    # jumlah kolomnya tidak konsisten (mis. koma di dalam nilai yang tidak diapit kutip).
+    percobaan = [
+        dict(),  # default: delimiter koma, engine C (paling cepat, cukup utk CSV standar)
+        dict(sep=None, engine="python"),  # auto-deteksi delimiter (titik koma/tab/dll)
+        dict(sep=None, engine="python", on_bad_lines="skip"),  # buang baris yang formatnya rusak
+    ]
+    error_terakhir = None
+    for kwargs in percobaan:
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, **kwargs)
+            catatan = None
+            if kwargs.get("on_bad_lines") == "skip":
+                catatan = (
+                    "⚠️ Sebagian baris di file CSV ini jumlah kolomnya tidak konsisten "
+                    "(kemungkinan ada delimiter di dalam salah satu nilai yang tidak diapit "
+                    "tanda kutip), sehingga baris-baris itu dilewati saat membaca. Data di "
+                    "bawah ini kemungkinan tidak 100% lengkap -- sebaiknya periksa ulang file "
+                    "sumbernya kalau perlu semua baris ikut terbaca."
+                )
+            return df, catatan
+        except Exception as e:
+            error_terakhir = e
+            continue
+    raise RuntimeError(
+        "Gagal membaca file CSV ini walau sudah dicoba beberapa cara (delimiter default, "
+        "delimiter otomatis). Kemungkinan formatnya tidak konsisten (jumlah kolom berbeda-beda "
+        f"di beberapa baris). Detail teknis: {error_terakhir}"
+    ) from error_terakhir
+
+
 def render_dataset_upload_qa(page_key: str = "upload_dataset"):
     """Fitur upload dataset (CSV/XLSX) bebas + tanya-AI tentang isinya. HANYA dipanggil
     untuk super user (lihat pemanggilannya di view_dashboard_satker.py)."""
@@ -971,10 +1096,7 @@ def render_dataset_upload_qa(page_key: str = "upload_dataset"):
         return
 
     try:
-        if uploaded_file.name.lower().endswith((".xlsx", ".xls")):
-            df_upload = pd.read_excel(uploaded_file)
-        else:
-            df_upload = pd.read_csv(uploaded_file)
+        df_upload, catatan_baca = _baca_file_upload(uploaded_file)
     except Exception as e:
         st.error(f"Gagal membaca file: {e}")
         return
@@ -982,6 +1104,9 @@ def render_dataset_upload_qa(page_key: str = "upload_dataset"):
     if df_upload.empty:
         st.warning("File berhasil dibaca tapi tidak ada baris data.")
         return
+
+    if catatan_baca:
+        st.warning(catatan_baca)
 
     st.success(f"Berhasil memuat **{len(df_upload):,} baris** x **{len(df_upload.columns)} kolom**.")
     with st.expander("Pratinjau data (20 baris pertama)", expanded=False):
