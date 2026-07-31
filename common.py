@@ -358,7 +358,9 @@ def hitung_proyeksi_per_kategori(
             total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
             total_bobot += BOBOT_TAHUN[i]
             tahun_dipakai_semua.add(tahun_y - i)
-        hasil[label] = (total_rate / total_bobot) * pagu_now if total_bobot > 0 else None
+        hasil[label] = (
+            (total_rate / total_bobot) * pagu_now if (total_bobot > 0 and pagu_now > 0) else None
+        )
     return hasil, sorted(tahun_dipakai_semua, reverse=True)
 
 
@@ -377,18 +379,37 @@ def isi_tabel_proyeksi(
                 tabel_tampil.loc[kat, BULAN_KOLOM[:bulan_penuh_terakhir]].sum()
                 if bulan_penuh_terakhir else 0
             )
-            if proyeksi_kat is None:
-                rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
-                for m in range(bulan_penuh_terakhir, 12):
-                    tabel_tampil.loc[kat, BULAN_KOLOM[m]] = rerata_kat
-                continue
+            # Proyeksi cadangan berbasis run-rate realisasi TAHUN BERJALAN sejauh ini (dipakai
+            # kalau tidak ada histori SAMA SEKALI, ATAU sebagai batas bawah kalau model
+            # berbasis histori ternyata memprediksi lebih rendah dari yang sudah benar-benar
+            # terealisasi -- lihat catatan di bawah).
+            rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
+            target_runrate = rerata_kat * 12
+            bentuk_runrate = np.full(12 - bulan_penuh_terakhir, rerata_kat)
 
-            target_tahun_penuh = proyeksi_kat.sum()
+            if proyeksi_kat is None:
+                target_tahun_penuh = target_runrate
+                bentuk_depan = bentuk_runrate
+            else:
+                target_riwayat = proyeksi_kat.sum()
+                if target_runrate > target_riwayat:
+                    # Realisasi tahun berjalan sudah melampaui pola tahun-tahun sebelumnya (mis.
+                    # krn kenaikan pagu/percepatan belanja tahun ini) -- kalau tetap dipaksa
+                    # pakai target historis, sisa_target di bawah akan jadi 0 (atau bahkan
+                    # proyeksi per bulan jadi jauh lebih rendah dari rata-rata realisasi
+                    # berjalan). Pakai proyeksi run-rate sbg gantinya supaya masuk akal.
+                    target_tahun_penuh = target_runrate
+                    bentuk_depan = bentuk_runrate
+                else:
+                    target_tahun_penuh = target_riwayat
+                    bentuk_depan = proyeksi_kat[bulan_penuh_terakhir:]
+
             sisa_target = max(target_tahun_penuh - actual_sum, 0)
-            proyeksi_depan_mentah = proyeksi_kat[bulan_penuh_terakhir:]
-            total_depan_mentah = proyeksi_depan_mentah.sum()
-            if total_depan_mentah > 0:
-                proyeksi_depan = proyeksi_depan_mentah * (sisa_target / total_depan_mentah)
+            total_bentuk_depan = bentuk_depan.sum()
+            if total_bentuk_depan > 0:
+                proyeksi_depan = bentuk_depan * (sisa_target / total_bentuk_depan)
+            elif sisa_target > 0:
+                proyeksi_depan = np.full(12 - bulan_penuh_terakhir, sisa_target / (12 - bulan_penuh_terakhir))
             else:
                 proyeksi_depan = np.zeros(12 - bulan_penuh_terakhir)
             for idx, m in enumerate(range(bulan_penuh_terakhir, 12)):
@@ -408,6 +429,18 @@ def isi_tabel_proyeksi(
             if total_proyeksi_depan > sisa_pagu_kat:
                 faktor_skala = (sisa_pagu_kat / total_proyeksi_depan) if total_proyeksi_depan > 0 else 0
                 tabel_tampil.loc[kat, BULAN_KOLOM[bulan_penuh_terakhir:]] = proyeksi_depan * faktor_skala
+
+        # Jaring pengaman terakhir: kolom bulan >= bulan_penuh_terakhir TIDAK BOLEH lebih kecil
+        # dari data aktual yang sudah benar-benar tercatat di sumber data (mis. bulan berjalan
+        # yang datanya baru sebagian tapi sudah lebih besar dari estimasi proyeksinya). Tanpa
+        # ini, "Total Realisasi + Proyeksi Akhir Tahun" bisa keliru tampil LEBIH KECIL dari
+        # "Total Realisasi" murni -- yang secara logika tidak boleh terjadi.
+        for kat in tabel_tampil.index:
+            for m in range(bulan_penuh_terakhir, 12):
+                kol = BULAN_KOLOM[m]
+                asli = tabel_aktual.loc[kat, kol]
+                if pd.notna(asli) and asli > tabel_tampil.loc[kat, kol]:
+                    tabel_tampil.loc[kat, kol] = asli
 
     return tabel_tampil
 
@@ -438,6 +471,60 @@ def get_groq_client():
     if not api_key:
         return None
     return Groq(api_key=api_key)
+
+
+def _pesan_error_groq(e) -> str:
+    """Gabungkan detail error Groq (message + body) jadi satu string lowercase utk deteksi
+    jenis error, dipakai oleh _groq_chat_dgn_fallback & pesan error yang ditampilkan ke user."""
+    detail = str(getattr(e, "message", None) or e)
+    body = getattr(e, "body", None)
+    return f"{detail} {body}".lower()
+
+
+def _groq_chat_dgn_fallback(client, **kwargs):
+    """Panggil Groq chat completion pakai GROQ_MODEL; kalau gagal spesifik karena masalah
+    tool-calling (model tsb kadang tidak stabil utk tool/function calling di Groq -- error
+    "tool_use_failed" / "Tool choice is none, but model called a tool"), otomatis dicoba
+    ulang SEKALI pakai GROQ_MODEL_FALLBACK_TOOLS. Kalau tetap gagal atau errornya bukan soal
+    tool-calling, exception aslinya dilempar lagi supaya ditangani pemanggil seperti biasa."""
+    try:
+        return client.chat.completions.create(model=GROQ_MODEL, **kwargs)
+    except Exception as e:
+        pesan = _pesan_error_groq(e)
+        if "tool_use_failed" in pesan or "tool choice" in pesan:
+            return client.chat.completions.create(model=GROQ_MODEL_FALLBACK_TOOLS, **kwargs)
+        raise
+
+
+# Batas ukuran hasil tool-calling yang dikirim balik ke Groq -- mencegah error "Please reduce
+# the length of the messages or completion" kalau hasil query/agregasi user ternyata sangat
+# besar (mis. banyak baris/kolom dgn teks panjang).
+MAKS_BARIS_HASIL_TOOL = 50
+MAKS_PANJANG_TEKS_SEL = 300
+MAKS_PANJANG_JSON_TOOL = 8000
+
+
+def _potong_teks_dalam_records(records: list) -> list:
+    """Potong nilai teks yang kepanjangan di tiap field hasil query/agregasi, supaya hasil
+    tool-calling yang dikirim ke Groq tidak membengkak gara-gara 1-2 kolom teks panjang."""
+    hasil = []
+    for r in records:
+        baris = {}
+        for k, v in r.items():
+            if isinstance(v, str) and len(v) > MAKS_PANJANG_TEKS_SEL:
+                v = v[:MAKS_PANJANG_TEKS_SEL] + "…(dipotong)"
+            baris[k] = v
+        hasil.append(baris)
+    return hasil
+
+
+def _json_tool_aman(hasil: dict) -> str:
+    """Serialize hasil tool ke JSON dgn batas ukuran akhir sbg jaring pengaman terakhir."""
+    import json as _json
+    s = _json.dumps(hasil, ensure_ascii=False, default=str)
+    if len(s) > MAKS_PANJANG_JSON_TOOL:
+        s = s[:MAKS_PANJANG_JSON_TOOL] + '... (dipotong krn hasilnya terlalu besar -- coba pertanyaan yang lebih spesifik/sempit)'
+    return s
 
 
 def kpi_card(label: str, value: str, delta: str = None):
@@ -601,7 +688,7 @@ def render_ai_section(
             )
         else:
             hasil = {"error": f"Fungsi tidak dikenal: {nama_fungsi}"}
-        return _json.dumps(hasil, ensure_ascii=False)
+        return _json_tool_aman(hasil)
 
     # --- Narasi otomatis ---
     st.subheader("🤖 Narasi Otomatis")
@@ -615,8 +702,8 @@ def render_ai_section(
         if st.button("Buat / Perbarui Narasi", key=f"btn_{cache_key}"):
             with st.spinner("AI sedang menyusun narasi..."):
                 try:
-                    resp = client.chat.completions.create(
-                        model=GROQ_MODEL,
+                    resp = _groq_chat_dgn_fallback(
+                        client,
                         messages=[
                             {
                                 "role": "system",
@@ -692,8 +779,8 @@ def render_ai_section(
 
                 jawaban = None
                 try:
-                    resp = client.chat.completions.create(
-                        model=GROQ_MODEL, messages=messages, tools=tools_groq, tool_choice="auto",
+                    resp = _groq_chat_dgn_fallback(
+                        client, messages=messages, tools=tools_groq, tool_choice="auto",
                     )
                     msg = resp.choices[0].message
 
@@ -716,14 +803,29 @@ def render_ai_section(
                                 args = {}
                             hasil_tool = _jalankan_tool_call(tc.function.name, args)
                             messages.append({"role": "tool", "tool_call_id": tc.id, "content": hasil_tool})
-                        resp2 = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+                        resp2 = _groq_chat_dgn_fallback(client, messages=messages)
                         jawaban = resp2.choices[0].message.content
                     else:
                         jawaban = msg.content
                 except Exception as e:
+                    pesan_lower = _pesan_error_groq(e)
                     detail = getattr(e, "message", None) or str(e)
                     body = getattr(e, "body", None)
-                    jawaban = f"⚠️ Gagal memanggil Groq API: {detail}"
+                    if "reduce the length" in pesan_lower or "context" in pesan_lower and "length" in pesan_lower:
+                        jawaban = (
+                            "⚠️ Percakapan atau hasil pencariannya terlalu besar buat diproses AI. "
+                            "Coba: (1) klik **🗑️ Reset Chat** untuk mulai percakapan baru, atau "
+                            "(2) ajukan pertanyaan yang lebih spesifik/sempit (mis. sebutkan nama "
+                            "kementerian/satker/kata kunci yang lebih pasti)."
+                        )
+                    elif "tool_use_failed" in pesan_lower or "tool choice" in pesan_lower:
+                        jawaban = (
+                            "⚠️ Model AI sedang tidak stabil untuk fitur pencarian data ini "
+                            "(sudah dicoba dgn model cadangan, tetap gagal). Coba tanya ulang "
+                            "beberapa saat lagi."
+                        )
+                    else:
+                        jawaban = f"⚠️ Gagal memanggil Groq API: {detail}"
                     with st.expander("Detail error (untuk debugging)"):
                         st.code(f"{type(e).__name__}: {detail}\n\nBody: {body}")
 
@@ -981,9 +1083,23 @@ Data {label_kategori}{cakupan}:
 
 def _analisis_dataset_builder(df_upload: pd.DataFrame):
     FUNGSI_VALID = {"sum", "mean", "count", "min", "max", "median", "std", "nunique"}
+    # Beberapa pertanyaan user berbentuk "apa saja X" (mis. "apa saja kegiatan PN di riau?")
+    # -- ini bukan agregasi angka, tapi minta DAFTAR nilai unik. Model kadang mencoba
+    # agg_fungsi="list" utk kasus begini (bukan fungsi pandas asli) -- ditangani khusus di sini
+    # supaya tetap terjawab benar (bukan cuma fallback diam-diam ke "sum" yang gagal di kolom teks).
+    FUNGSI_DAFTAR_UNIK = {"list", "unique", "distinct"}
 
     def analisis_dataset(query_filter: str = None, groupby_kolom: list = None,
                           agg_kolom: str = None, agg_fungsi: str = "sum", limit: int = 20) -> dict:
+        # Batasi limit (baik terlalu besar MAUPUN 0/negatif dari model) supaya hasil tool tidak
+        # pernah membengkak sampai bikin panggilan Groq berikutnya kena error "Please reduce
+        # the length of the messages" -- lihat MAKS_BARIS_HASIL_TOOL.
+        try:
+            limit = int(limit) if limit else 20
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(limit, MAKS_BARIS_HASIL_TOOL))
+
         d = df_upload
         if query_filter:
             try:
@@ -1001,24 +1117,40 @@ def _analisis_dataset_builder(df_upload: pd.DataFrame):
             return {"ditemukan": False, "pesan": "Tidak ada baris yang cocok dengan filter ini."}
 
         hasil = {"jumlah_baris_cocok": int(len(d))}
-        fn = agg_fungsi if agg_fungsi in FUNGSI_VALID else "sum"
 
         if agg_kolom and agg_kolom not in d.columns:
             return {"error": f"Kolom '{agg_kolom}' tidak ada di dataset. Kolom tersedia: {list(df_upload.columns)}"}
 
+        # Kasus "daftar nilai unik" (agg_fungsi list/unique/distinct) -- utk pertanyaan
+        # "apa saja ...", BUKAN agregasi angka.
+        if agg_kolom and agg_fungsi in FUNGSI_DAFTAR_UNIK:
+            kolom_grup = (groupby_kolom or []) + [agg_kolom]
+            kolom_grup = [c for c in dict.fromkeys(kolom_grup) if c in d.columns]  # unik & valid
+            unik = d[kolom_grup].drop_duplicates().head(limit)
+            hasil["daftar_nilai_unik"] = _potong_teks_dalam_records(unik.to_dict(orient="records"))
+            hasil["jumlah_nilai_unik_ditampilkan"] = len(unik)
+            hasil["catatan"] = f"Dibatasi maks {limit} baris unik pertama (dari {d[agg_kolom].nunique():,} total nilai unik)."
+            return hasil
+
+        fn = agg_fungsi if agg_fungsi in FUNGSI_VALID else "sum"
         try:
             if groupby_kolom and agg_kolom:
                 agg_df = d.groupby(groupby_kolom)[agg_kolom].agg(fn).reset_index()
                 agg_df = agg_df.sort_values(agg_kolom, ascending=False).head(limit)
-                hasil["hasil_agregasi"] = agg_df.to_dict(orient="records")
+                hasil["hasil_agregasi"] = _potong_teks_dalam_records(agg_df.to_dict(orient="records"))
             elif agg_kolom:
                 nilai = getattr(d[agg_kolom], fn)()
                 try:
                     hasil["hasil"] = float(nilai)
                 except (TypeError, ValueError):
                     hasil["hasil"] = str(nilai)
+            elif groupby_kolom:
+                # groupby tanpa agg_kolom -> anggap user cuma mau daftar kombinasi unik.
+                kolom_valid = [c for c in groupby_kolom if c in d.columns]
+                unik = d[kolom_valid].drop_duplicates().head(limit) if kolom_valid else d.head(limit)
+                hasil["contoh_baris"] = _potong_teks_dalam_records(unik.to_dict(orient="records"))
             else:
-                hasil["contoh_baris"] = d.head(limit).to_dict(orient="records")
+                hasil["contoh_baris"] = _potong_teks_dalam_records(d.head(limit).to_dict(orient="records"))
         except Exception as e:
             hasil["error_agregasi"] = str(e)
 
@@ -1168,12 +1300,19 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
                     },
                     "agg_fungsi": {
                         "type": ["string", "null"],
-                        "enum": ["sum", "mean", "count", "min", "max", "median", "std", "nunique", None],
-                        "description": "Fungsi agregasi, default 'sum'.",
+                        "enum": [
+                            "sum", "mean", "count", "min", "max", "median", "std", "nunique",
+                            "list", "unique", "distinct", None,
+                        ],
+                        "description": (
+                            "Fungsi agregasi, default 'sum'. Utk pertanyaan 'apa saja ...' (minta "
+                            "DAFTAR nilai, bukan angka), pakai 'list'/'unique'/'distinct' dgn "
+                            "agg_kolom = kolom yang mau didaftar isinya."
+                        ),
                     },
                     "limit": {
                         "type": ["integer", "null"],
-                        "description": "Batas baris hasil ditampilkan, default 20.",
+                        "description": f"Batas baris hasil ditampilkan, default 20, maksimal {MAKS_BARIS_HASIL_TOOL}.",
                     },
                 },
                 "required": [],
@@ -1192,7 +1331,7 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
             )
         else:
             hasil = {"error": f"Fungsi tidak dikenal: {nama_fungsi}"}
-        return _json.dumps(hasil, ensure_ascii=False, default=str)
+        return _json_tool_aman(hasil)
 
     if client is None:
         st.info(
@@ -1241,8 +1380,8 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
 
             jawaban = None
             try:
-                resp = client.chat.completions.create(
-                    model=GROQ_MODEL, messages=messages, tools=tools_groq, tool_choice="auto",
+                resp = _groq_chat_dgn_fallback(
+                    client, messages=messages, tools=tools_groq, tool_choice="auto",
                 )
                 msg = resp.choices[0].message
 
@@ -1265,13 +1404,27 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
                             args = {}
                         hasil_tool = _jalankan_tool_call(tc.function.name, args)
                         messages.append({"role": "tool", "tool_call_id": tc.id, "content": hasil_tool})
-                    resp2 = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+                    resp2 = _groq_chat_dgn_fallback(client, messages=messages)
                     jawaban = resp2.choices[0].message.content
                 else:
                     jawaban = msg.content
             except Exception as e:
+                pesan_lower = _pesan_error_groq(e)
                 detail = getattr(e, "message", None) or str(e)
-                jawaban = f"⚠️ Gagal memanggil Groq API: {detail}"
+                if "reduce the length" in pesan_lower or ("context" in pesan_lower and "length" in pesan_lower):
+                    jawaban = (
+                        "⚠️ Percakapan atau hasil query-nya terlalu besar buat diproses AI. Coba: "
+                        "(1) klik **🗑️ Reset Chat** untuk mulai percakapan baru, atau (2) ajukan "
+                        "pertanyaan yang lebih spesifik/sempit (mis. sebutkan nilai/filter yang "
+                        "lebih pasti supaya hasilnya tidak terlalu banyak baris)."
+                    )
+                elif "tool_use_failed" in pesan_lower or "tool choice" in pesan_lower:
+                    jawaban = (
+                        "⚠️ Model AI sedang tidak stabil untuk fitur analisis data ini (sudah "
+                        "dicoba dgn model cadangan, tetap gagal). Coba tanya ulang beberapa saat lagi."
+                    )
+                else:
+                    jawaban = f"⚠️ Gagal memanggil Groq API: {detail}"
 
         st.session_state[chat_state_key].append({"role": "assistant", "content": jawaban})
         with st.chat_message("assistant"):
