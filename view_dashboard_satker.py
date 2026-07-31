@@ -19,7 +19,7 @@ from common import (
     get_data, tanggal_update_data, kpi_card,
     hitung_proyeksi_agregat, hitung_proyeksi_per_kategori, isi_tabel_proyeksi,
     hitung_bulan_penuh_terakhir, buat_cari_generik, render_ai_section, render_dataset_upload_qa,
-    render_disclaimer, LABEL_BELANJA_PEGAWAI,
+    LABEL_BELANJA_PEGAWAI,
 )
 
 df = get_data()
@@ -162,7 +162,6 @@ persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
 st.title("📊 Dashboard Pagu & Realisasi Satker")
 st.caption(f"🕒 Data terakhir diperbarui: {tanggal_update_data()}")
 st.caption(f"{nmdept} — {nmsatker} — Tahun {tahun}")
-render_disclaimer()
 
 r1c1, r1c2 = st.columns(2)
 r2c1, r2c2 = st.columns(2)
