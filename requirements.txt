@@ -1,6 +1,5 @@
-streamlit
-pandas
-numpy
-plotly
-altair
-openpyxl
+streamlit>=1.59
+pandas>=2.2
+plotly>=6.0
+groq>=1.5
+supabase>=2.9
