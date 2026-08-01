@@ -390,7 +390,18 @@ def isi_tabel_proyeksi(
                 # bulan yang secara historis realisasinya tinggi (mis. akhir tahun) tetap
                 # diproyeksikan tinggi, bukan disamaratakan.
                 bentuk_depan = proyeksi_kat[bulan_penuh_terakhir:]
-                target_tahun_penuh = proyeksi_kat.sum()
+                target_riwayat = proyeksi_kat.sum()
+
+                # Kalau realisasi tahun ini SUDAH melebihi target historis (mis. karena pagu
+                # tahun ini lebih kecil dari tahun-tahun sebelumnya, atau realisasi tahun ini
+                # memang jauh lebih cepat dari biasanya), target historis jadi tidak masuk akal
+                # dipakai apa adanya -- bisa bikin sisa_target 0 padahal realisasi jelas masih
+                # akan terus berjalan. Di kondisi ini, target dinaikkan ke proyeksi run-rate
+                # (rata-rata realisasi bulan berjalan tahun ini x 12) sbg lantai bawah, TAPI
+                # bentuk sebaran bulanannya (bentuk_depan) tetap dari pola historis, bukan rata.
+                rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
+                target_runrate = rerata_kat * 12
+                target_tahun_penuh = max(target_riwayat, target_runrate)
 
             sisa_target = max(target_tahun_penuh - actual_sum, 0)
             total_bentuk_depan = bentuk_depan.sum()
