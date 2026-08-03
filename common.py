@@ -50,6 +50,20 @@ KODE_JENIS_TKD = [61, 62, 63, 64, 65, 66]
 # hitung_proyeksi_per_kategori & isi_tabel_proyeksi).
 LABEL_BELANJA_PEGAWAI = LABEL_JENIS_BELANJA_SINGKAT[51]
 
+# --- Penyesuaian khusus: kenaikan tunjangan kinerja Kementerian Pertahanan ---
+# Mulai Juli 2026 ada kenaikan tukin (akun 512411) sebesar 28%/bulan, dirapel di
+# September utk bulan Juli-Agustus yang sudah terlanjur direalisasikan sebelum kenaikan
+# berlaku. Lihat sesuaikan_proyeksi_tukin_kemenhan() di bawah -- HANYA menyentuh bulan
+# yang masih proyeksi (belum berakhir), tidak pernah mengubah angka realisasi aktual.
+KDDEPT_KEMENHAN = 12
+AKUN_TUKIN_KEMENHAN = [
+    "Belanja Pegawai (Tunjangan Khusus/Kegiatan/Kinerja)",
+    "Belanja Pegawai Tunjangan Khusus/Kegiatan/Kinerja PPPK",
+]
+BULAN_MULAI_KENAIKAN_TUKIN = 7  # Juli
+PERSEN_KENAIKAN_TUKIN = 0.28
+BULAN_RAPEL_TUKIN = 9  # September
+
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # openai/gpt-oss-120b kadang tidak stabil untuk tool/function calling di Groq (error
 # "tool_use_failed" / 400 BadRequestError sudah dilaporkan komunitas Groq). Kalau panggilan
@@ -367,6 +381,7 @@ def hitung_proyeksi_per_kategori(
 def isi_tabel_proyeksi(
     tabel_aktual: pd.DataFrame, proyeksi_per_kategori: dict, pagu_per_kategori: pd.Series,
     bulan_penuh_terakhir: int, kategori_dikecualikan_cap: str = LABEL_BELANJA_PEGAWAI,
+    kategori_rupiah_langsung: frozenset = frozenset({LABEL_BELANJA_PEGAWAI}),
 ) -> pd.DataFrame:
     """Isi bulan-bulan setelah bulan_penuh_terakhir dengan proyeksi (bukan double-count -- lihat
     catatan di app.py), lalu cap total (aktual+proyeksi) maksimal 100% pagu utk kategori selain
@@ -390,18 +405,21 @@ def isi_tabel_proyeksi(
                 # bulan yang secara historis realisasinya tinggi (mis. akhir tahun) tetap
                 # diproyeksikan tinggi, bukan disamaratakan.
                 bentuk_depan = proyeksi_kat[bulan_penuh_terakhir:]
-                target_riwayat = proyeksi_kat.sum()
+                target_tahun_penuh = proyeksi_kat.sum()
 
-                # Kalau realisasi tahun ini SUDAH melebihi target historis (mis. karena pagu
-                # tahun ini lebih kecil dari tahun-tahun sebelumnya, atau realisasi tahun ini
-                # memang jauh lebih cepat dari biasanya), target historis jadi tidak masuk akal
-                # dipakai apa adanya -- bisa bikin sisa_target 0 padahal realisasi jelas masih
-                # akan terus berjalan. Di kondisi ini, target dinaikkan ke proyeksi run-rate
-                # (rata-rata realisasi bulan berjalan tahun ini x 12) sbg lantai bawah, TAPI
-                # bentuk sebaran bulanannya (bentuk_depan) tetap dari pola historis, bukan rata.
-                rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
-                target_runrate = rerata_kat * 12
-                target_tahun_penuh = max(target_riwayat, target_runrate)
+                if kat in kategori_rupiah_langsung:
+                    # KHUSUS kategori rupiah-langsung (Belanja Pegawai): realisasi tahun
+                    # berjalan bisa saja sudah melebihi target historis (mis. karena pagu
+                    # tahun ini beda dari tahun-tahun sebelumnya, atau ada kenaikan gaji/
+                    # tunjangan). Di kondisi itu target dinaikkan ke proyeksi run-rate
+                    # (rata-rata realisasi bulan berjalan x 12) sbg lantai bawah -- TAPI
+                    # bentuk sebaran bulanannya tetap dari pola historis, bukan rata.
+                    # TIDAK diterapkan ke kategori lain krn realisasi tahunnya historis
+                    # jarang mendekati 100% pagu, jadi run-rate disini biasanya cuma bikin
+                    # proyeksi kebablasan ke atas (ke-cap 100% padahal seharusnya tidak).
+                    rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
+                    target_runrate = rerata_kat * 12
+                    target_tahun_penuh = max(target_tahun_penuh, target_runrate)
 
             sisa_target = max(target_tahun_penuh - actual_sum, 0)
             total_bentuk_depan = bentuk_depan.sum()
@@ -440,6 +458,56 @@ def isi_tabel_proyeksi(
                 asli = tabel_aktual.loc[kat, kol]
                 if pd.notna(asli) and asli > tabel_tampil.loc[kat, kol]:
                     tabel_tampil.loc[kat, kol] = asli
+
+    return tabel_tampil
+
+
+def sesuaikan_proyeksi_tukin_kemenhan(
+    df_scope: pd.DataFrame, tabel_tampil: pd.DataFrame, bulan_penuh_terakhir: int,
+) -> pd.DataFrame:
+    """Penyesuaian khusus proyeksi Belanja Pegawai utk Kementerian Pertahanan: mulai Juli
+    2026 ada kenaikan tunjangan kinerja (akun 512411) sebesar 28%/bulan, dirapel di
+    September utk Juli-Agustus yang sudah terlanjur direalisasikan sebelum kenaikan
+    berlaku. HANYA menyentuh bulan yang masih proyeksi (>= bulan_penuh_terakhir); tidak
+    pernah mengubah angka bulan yang sudah aktual/berakhir.
+
+    df_scope: data mentah pada cakupan (satker/kementerian/semua) yang sedang aktif di
+              dashboard -- fungsi ini otomatis menyaring baris Kemenhan (KDDEPT=12) dan
+              tidak melakukan apa-apa kalau Kemenhan tidak ada di cakupan ini.
+    """
+    if bulan_penuh_terakhir >= 12 or LABEL_BELANJA_PEGAWAI not in tabel_tampil.index:
+        return tabel_tampil
+
+    tukin = df_scope[
+        (df_scope["KDDEPT"] == KDDEPT_KEMENHAN) & (df_scope["AKUN"].isin(AKUN_TUKIN_KEMENHAN))
+    ]
+    if tukin.empty:
+        return tabel_tampil  # Kemenhan tidak ada di cakupan yang sedang dilihat
+
+    # Baseline bulanan = rata-rata realisasi AKTUAL akun tukin sebelum bulan kenaikan
+    # (Jan..Jun yang sudah benar-benar berakhir).
+    bulan_baseline = [
+        BULAN_KOLOM[i] for i in range(BULAN_MULAI_KENAIKAN_TUKIN - 1) if i < bulan_penuh_terakhir
+    ]
+    if not bulan_baseline:
+        return tabel_tampil  # belum cukup data aktual utk hitung baseline
+    baseline_bulanan = tukin[bulan_baseline].sum().sum() / len(bulan_baseline)
+    kenaikan_bulanan = baseline_bulanan * PERSEN_KENAIKAN_TUKIN
+
+    tabel_tampil = tabel_tampil.copy()
+    for m in range(bulan_penuh_terakhir, 12):
+        bulan_ke = m + 1
+        if bulan_ke >= BULAN_MULAI_KENAIKAN_TUKIN:
+            tabel_tampil.loc[LABEL_BELANJA_PEGAWAI, BULAN_KOLOM[m]] += kenaikan_bulanan
+        if bulan_ke == BULAN_RAPEL_TUKIN:
+            # Rapel utk bulan-bulan (Jul, Agst) yang SUDAH aktual (bukan proyeksi) sebelum
+            # kenaikan sempat tercermin di realisasi -- bulan yg masih proyeksi sendiri
+            # sudah otomatis dapat kenaikannya langsung dari baris di atas, tidak perlu rapel.
+            bulan_tertunda = [b for b in (7, 8) if b <= bulan_penuh_terakhir]
+            if bulan_tertunda:
+                tabel_tampil.loc[LABEL_BELANJA_PEGAWAI, BULAN_KOLOM[m]] += (
+                    kenaikan_bulanan * len(bulan_tertunda)
+                )
 
     return tabel_tampil
 
