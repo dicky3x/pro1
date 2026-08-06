@@ -484,14 +484,43 @@ def _agregasi_ke_kunci_granular(df: pd.DataFrame, key_cols: list = KUNCI_GRANULA
     return df.groupby(["TAHUN"] + list(key_cols), as_index=False).agg(agg)
 
 
-def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
-    """[GRANULAR] Proyeksi 12 bulan (rupiah) utk seluruh entitas terpilih.
+def _hitung_proyeksi_agregat_nongranular(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
+    """Fallback -- metode lama (rate dihitung langsung di level scope filter_dict, tanpa
+    granularitas satker/akun). Dipakai OTOMATIS saat df_all tidak punya kolom granular
+    (KDSATKER/JENIS BELANJA/AKUN) -- mis. dataset kategori Prioritas Presiden/Program
+    Strategis di Halaman 2 & 3 yang skemanya beda dari dataset satker di Halaman 1."""
+    total_rate = np.zeros(12)
+    total_bobot = 0.0
+    tahun_dipakai = []
+    for i in range(1, 6):
+        d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+        pagu_prev = d_prev["PAGU"].sum() if not d_prev.empty else 0
+        if pagu_prev <= 0:
+            continue
+        monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+        total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
+        total_bobot += BOBOT_TAHUN[i]
+        tahun_dipakai.append(tahun_y - i)
+    if total_bobot == 0:
+        return None, tahun_dipakai
+    return (total_rate / total_bobot) * pagu_y, tahun_dipakai
 
-    Beda dgn versi lama: rate/profil dihitung per (KDSATKER, JENIS BELANJA, AKUN) dulu
-    (dgn fallback satker sejenis kalau perlu), baru dijumlahkan ke scope filter_dict --
-    bukan dihitung langsung di level scope teragregasi. Return (array atau None,
-    daftar tahun dipakai), signature & makna return SAMA seperti versi lama.
+
+def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
+    """[GRANULAR, dgn fallback otomatis] Proyeksi 12 bulan (rupiah) utk seluruh entitas
+    terpilih.
+
+    Kalau df_all punya kolom granular lengkap (KDSATKER, JENIS BELANJA, AKUN) --
+    dipakai dataset satker Halaman 1/4 -- rate/profil dihitung per (KDSATKER, JENIS
+    BELANJA, AKUN) dulu (dgn fallback satker sejenis kalau perlu), baru dijumlahkan ke
+    scope filter_dict. Kalau TIDAK (mis. dataset kategori Halaman 2/3 yang skemanya
+    beda), otomatis pakai _hitung_proyeksi_agregat_nongranular (metode lama) supaya
+    fungsi ini tetap generik & tidak error pada skema data yang berbeda. Return (array
+    atau None, daftar tahun dipakai), signature & makna return SAMA seperti versi lama.
     """
+    if not set(KUNCI_GRANULAR).issubset(df_all.columns):
+        return _hitung_proyeksi_agregat_nongranular(df_all, tahun_y, pagu_y, filter_dict)
+
     df_all = _agregasi_ke_kunci_granular(df_all)
     bobot_tahun = _bobot_per_tahun_absolut(tahun_y, BOBOT_TAHUN)
     df_now = _filter_entitas(df_all, tahun_y, filter_dict)
@@ -516,12 +545,61 @@ def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, f
     return baseline.sum(axis=0), tahun_dipakai
 
 
+def _hitung_proyeksi_per_kategori_nongranular(df_all: pd.DataFrame, tahun_y: int,
+                                               pagu_per_kategori_now: pd.Series,
+                                               filter_dict: dict, kolom_kategori: str):
+    """Fallback -- metode lama, dipakai otomatis saat df_all tidak punya kolom granular
+    (lihat catatan di hitung_proyeksi_agregat/_hitung_proyeksi_agregat_nongranular)."""
+    hasil = {}
+    tahun_dipakai_semua = set()
+    for label, pagu_now in pagu_per_kategori_now.items():
+        if kolom_kategori == "LABEL_JENIS_BELANJA" and label == LABEL_BELANJA_PEGAWAI:
+            total_weighted = np.zeros(12)
+            total_bobot = 0.0
+            tahun_dipakai_label = []
+            for i in range(1, 6):
+                d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+                d_prev = d_prev[d_prev[kolom_kategori] == label]
+                if d_prev.empty:
+                    continue
+                monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+                total_weighted += BOBOT_TAHUN[i] * monthly_prev
+                total_bobot += BOBOT_TAHUN[i]
+                tahun_dipakai_label.append(tahun_y - i)
+            hasil[label] = (total_weighted / total_bobot) if total_bobot > 0 else None
+            tahun_dipakai_semua.update(tahun_dipakai_label)
+            continue
+
+        total_rate = np.zeros(12)
+        total_bobot = 0.0
+        for i in range(1, 6):
+            d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+            d_prev = d_prev[d_prev[kolom_kategori] == label]
+            pagu_prev = d_prev["PAGU"].sum() if not d_prev.empty else 0
+            if pagu_prev <= 0:
+                continue
+            monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+            total_rate += BOBOT_TAHUN[i] * (monthly_prev / pagu_prev)
+            total_bobot += BOBOT_TAHUN[i]
+            tahun_dipakai_semua.add(tahun_y - i)
+        hasil[label] = (
+            (total_rate / total_bobot) * pagu_now if (total_bobot > 0 and pagu_now > 0) else None
+        )
+    return hasil, sorted(tahun_dipakai_semua, reverse=True)
+
+
 def hitung_proyeksi_per_kategori(df_all: pd.DataFrame, tahun_y: int, pagu_per_kategori_now: pd.Series,
                                   filter_dict: dict, kolom_kategori: str):
-    """[GRANULAR] Proyeksi 12 bulan (rupiah) per kategori. Return (dict label->array(12)
-    atau None, daftar tahun dipakai) -- signature & makna return SAMA seperti versi lama,
-    supaya isi_tabel_proyeksi & pemanggil lain tidak perlu berubah.
+    """[GRANULAR, dgn fallback otomatis] Proyeksi 12 bulan (rupiah) per kategori. Return
+    (dict label->array(12) atau None, daftar tahun dipakai) -- signature & makna return
+    SAMA seperti versi lama. Fallback otomatis ke metode lama kalau df_all tidak punya
+    kolom granular (lihat catatan di hitung_proyeksi_agregat).
     """
+    if not set(KUNCI_GRANULAR).issubset(df_all.columns):
+        return _hitung_proyeksi_per_kategori_nongranular(
+            df_all, tahun_y, pagu_per_kategori_now, filter_dict, kolom_kategori
+        )
+
     hasil = {}
     tahun_dipakai_semua = set()
     df_all = _agregasi_ke_kunci_granular(df_all)
