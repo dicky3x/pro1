@@ -19,7 +19,7 @@ from common import (
     get_data, tanggal_update_data, kpi_card,
     hitung_proyeksi_agregat, hitung_proyeksi_per_kategori, isi_tabel_proyeksi,
     hitung_bulan_penuh_terakhir, buat_cari_generik, render_ai_section, render_dataset_upload_qa,
-    LABEL_BELANJA_PEGAWAI, sesuaikan_proyeksi_tukin_kemenhan,
+    LABEL_BELANJA_PEGAWAI,
 )
 
 df = get_data()
@@ -327,11 +327,6 @@ tabel_tampil = isi_tabel_proyeksi(
     realisasi_aktual_jenis, proyeksi_per_jenis, pagu_per_jenis, bulan_penuh_terakhir,
     kategori_dikecualikan_cap=LABEL_BELANJA_PEGAWAI,
 )
-
-# Penyesuaian khusus: kenaikan tunjangan kinerja Kementerian Pertahanan 28%/bulan mulai
-# Juli, dirapel di September (lihat common.py::sesuaikan_proyeksi_tukin_kemenhan). Otomatis
-# tidak melakukan apa-apa kalau Kemenhan tidak ada di cakupan yang sedang dilihat.
-tabel_tampil = sesuaikan_proyeksi_tukin_kemenhan(df_satker, tabel_tampil, bulan_penuh_terakhir)
 
 # --- Transpose: baris = bulan, kolom = jenis belanja, + kolom TOTAL di kanan ---
 tabel_t = tabel_tampil.reindex(urutan_kode).T

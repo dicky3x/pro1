@@ -50,20 +50,6 @@ KODE_JENIS_TKD = [61, 62, 63, 64, 65, 66]
 # hitung_proyeksi_per_kategori & isi_tabel_proyeksi).
 LABEL_BELANJA_PEGAWAI = LABEL_JENIS_BELANJA_SINGKAT[51]
 
-# --- Penyesuaian khusus: kenaikan tunjangan kinerja Kementerian Pertahanan ---
-# Mulai Juli 2026 ada kenaikan tukin (akun 512411) sebesar 28%/bulan, dirapel di
-# September utk bulan Juli-Agustus yang sudah terlanjur direalisasikan sebelum kenaikan
-# berlaku. Lihat sesuaikan_proyeksi_tukin_kemenhan() di bawah -- HANYA menyentuh bulan
-# yang masih proyeksi (belum berakhir), tidak pernah mengubah angka realisasi aktual.
-KDDEPT_KEMENHAN = 12
-AKUN_TUKIN_KEMENHAN = [
-    "Belanja Pegawai (Tunjangan Khusus/Kegiatan/Kinerja)",
-    "Belanja Pegawai Tunjangan Khusus/Kegiatan/Kinerja PPPK",
-]
-BULAN_MULAI_KENAIKAN_TUKIN = 7  # Juli
-PERSEN_KENAIKAN_TUKIN = 0.28
-BULAN_RAPEL_TUKIN = 9  # September
-
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 # openai/gpt-oss-120b kadang tidak stabil untuk tool/function calling di Groq (error
 # "tool_use_failed" / 400 BadRequestError sudah dilaporkan komunitas Groq). Kalau panggilan
@@ -269,30 +255,13 @@ def require_login(df_all: pd.DataFrame, judul_halaman: str = "Dashboard"):
 
 
 # --------------------------------------------------------------------------
-# Proyeksi -- HYBRID FORECASTING: weighted historical monthly profile per
-# (Satker x Jenis Belanja x Akun) + rolling forecast + fallback satker sejenis +
-# confidence score & early warning tersedia sbg fungsi tambahan di bawah.
+# Proyeksi -- rerata tertimbang tingkat realisasi 5 tahun sebelumnya x pagu tahun berjalan
 #
-# Perbaikan dari versi sebelumnya:
-#   1. Profil & tingkat serapan historis kini dihitung di granularitas SATKER x JENIS
-#      BELANJA x AKUN dulu (sesuai spesifikasi), baru dijumlahkan ke scope filter yang
-#      diminta -- bukan dihitung langsung di level scope teragregasi. Satker/akun tanpa
-#      histori sendiri otomatis fallback ke profil satker sejenis (KDDEPT + JENIS
-#      BELANJA + kelompok besar pagu), lalu ke rata-rata nasional per JENIS BELANJA.
-#   2. isi_tabel_proyeksi: "jaring pengaman terakhir" DIPERBAIKI supaya hanya menyentuh
-#      SATU bulan (bulan berjalan yang datanya baru sebagian), bukan seluruh sisa
-#      tahun -- versi lama bisa membuat kategori yang seharusnya dibatasi pagu (mis.
-#      Belanja Modal) tetap tampil melebihi pagu kalau data mentah kebetulan sudah
-#      terisi di bulan-bulan yang harusnya masih "masa depan".
-#   3. sesuaikan_proyeksi_tukin_kemenhan: pencocokan AKUN_TUKIN_KEMENHAN kini
-#      menghilangkan whitespace di awal/akhir sebelum dibandingkan -- versi lama
-#      kehilangan ~40% baris akun tukin yang punya spasi ekstra di data sumber,
-#      sehingga baseline kenaikan tukin dihitung dari data yang tidak lengkap.
+#   proyeksi_bulan_m = pagu_tahun_ini * [ Σ bobot_i * (realisasi_bulan_m_tahun(y-i) / pagu_tahun(y-i)) ] / Σ bobot_i
 #
-# Signature & makna return SETIAP fungsi publik (hitung_proyeksi_agregat,
-# hitung_proyeksi_per_kategori, isi_tabel_proyeksi, sesuaikan_proyeksi_tukin_kemenhan,
-# hitung_bulan_penuh_terakhir) TETAP SAMA seperti sebelumnya -- halaman-halaman yang
-# memanggilnya (app.py, pages/2_*.py, pages/3_*.py) TIDAK PERLU diubah.
+# Fungsi generik (bisa dipakai filter satker/kementerian ATAU kabupaten/kota) -- filter_dict
+# berisi pasangan {nama_kolom: nilai}, mis. {"KDDEPT": 15, "KDSATKER": 613739} atau
+# {"KABKOTA": "KAB. KAMPAR"}. Nilai None di filter_dict berarti tidak difilter (semua).
 # --------------------------------------------------------------------------
 
 def _filter_entitas(df_all: pd.DataFrame, thn: int, filter_dict: dict) -> pd.DataFrame:
@@ -303,192 +272,8 @@ def _filter_entitas(df_all: pd.DataFrame, thn: int, filter_dict: dict) -> pd.Dat
     return d
 
 
-
-
-# ============================================================================
-# Konfigurasi tambahan utk hybrid forecasting granular
-# ============================================================================
-
-KUNCI_GRANULAR = ["KDSATKER", "JENIS BELANJA", "AKUN"]
-_EDGE_PAGU_BUCKET = [0, 100e6, 500e6, 1e9, 5e9, 1e10, np.inf]
-_LABEL_PAGU_BUCKET = ["<100jt", "100jt-500jt", "500jt-1M", "1M-5M", "5M-10M", ">10M"]
-
-
-def _bucket_pagu(pagu: pd.Series) -> pd.Series:
-    """Kelompok ukuran pagu -- dipakai utk mencari 'satker sejenis' saat satker/akun
-    tidak punya histori sendiri."""
-    return pd.cut(pagu.clip(lower=0), bins=_EDGE_PAGU_BUCKET, labels=_LABEL_PAGU_BUCKET, include_lowest=True)
-
-
-def _bobot_per_tahun_absolut(tahun_y: int, bobot_tahun_offset: dict) -> dict:
-    """BOBOT_TAHUN aslinya berkunci offset (1=tahun_y-1, ..., 5=tahun_y-5). Fungsi ini
-    mengubahnya jadi dict {tahun_absolut: bobot} supaya bisa dipakai langsung sbg
-    map/groupby key thd kolom TAHUN."""
-    return {tahun_y - i: b for i, b in bobot_tahun_offset.items()}
-
-
-def _profil_granular(df_hist: pd.DataFrame, key_cols: list, bobot_tahun: dict,
-                      bulan_kolom: list) -> pd.DataFrame:
-    """Profil bulanan (proporsi, total=1), tingkat serapan historis tertimbang
-    (RATE_HIST = realisasi/pagu), dan rerata REALISASI RUPIAH BULANAN tertimbang
-    langsung (RP_<bulan> -- dipakai khusus Belanja Pegawai, lihat
-    _hitung_proyeksi_belanja_pegawai_granular), per kombinasi key_cols.
-
-    Weighted average dgn bobot_tahun, DINORMALISASI ULANG per key terhadap tahun yang
-    datanya benar-benar tersedia (kalau suatu tahun histori kosong utk key tertentu,
-    bobot tahun itu diabaikan & sisa bobot yang ada dinormalisasi -- sama seperti
-    perilaku kode lama).
-    """
-    df = df_hist.copy()
-    df["_TOTAL"] = df[bulan_kolom].sum(axis=1)
-    df["_BOBOT"] = df["TAHUN"].map(bobot_tahun).fillna(0.0)
-
-    # -- (a) profil bulanan: proporsi tiap bulan thd total tahun tsb --
-    valid = df[(df["_TOTAL"] > 0) & (df["_BOBOT"] > 0)].copy()
-    kolom_share = [f"_s_{b}" for b in bulan_kolom]
-    for b, sc in zip(bulan_kolom, kolom_share):
-        valid[sc] = (valid[b] / valid["_TOTAL"]) * valid["_BOBOT"]
-    agg_share = valid.groupby(key_cols)[kolom_share].sum()
-    bobot_share = valid.groupby(key_cols)["_BOBOT"].sum()
-    profil = agg_share.div(bobot_share, axis=0)
-    profil.columns = bulan_kolom
-
-    # -- (b) rerata REALISASI RUPIAH BULANAN langsung (bukan proporsi) --
-    dfb = df[df["_BOBOT"] > 0].copy()
-    kolom_rp = [f"RP_{b}" for b in bulan_kolom]
-    for b, rc in zip(bulan_kolom, kolom_rp):
-        dfb[rc] = dfb[b] * dfb["_BOBOT"]
-    agg_rp = dfb.groupby(key_cols)[kolom_rp].sum()
-    bobot_rp = dfb.groupby(key_cols)["_BOBOT"].sum()
-    rupiah_langsung = agg_rp.div(bobot_rp, axis=0)
-    rupiah_langsung.columns = kolom_rp
-
-    # -- (c) tingkat serapan historis (RATE_HIST = realisasi/pagu), tertimbang --
-    df["_RATE"] = np.where(df["PAGU"] > 0, df["_TOTAL"] / df["PAGU"], np.nan)
-    validr = df.dropna(subset=["_RATE"]).copy()
-    validr["_WRATE"] = validr["_RATE"] * validr["_BOBOT"]
-    agg = validr.groupby(key_cols).agg(
-        _WRATE_SUM=("_WRATE", "sum"), _BOBOT_RATE=("_BOBOT", "sum"),
-        RATE_MEAN=("_RATE", "mean"), RATE_STD=("_RATE", "std"), N_TAHUN=("_RATE", "count"),
-    )
-    agg["RATE_HIST"] = agg["_WRATE_SUM"] / agg["_BOBOT_RATE"].replace(0, np.nan)
-    agg["CV_RATE"] = (agg["RATE_STD"] / agg["RATE_MEAN"].replace(0, np.nan)).abs()
-
-    hasil = profil.join(rupiah_langsung, how="outer").join(
-        agg[["RATE_HIST", "CV_RATE", "N_TAHUN"]], how="outer"
-    )
-    hasil["N_TAHUN"] = hasil["N_TAHUN"].fillna(0).astype(int)
-    return hasil
-
-
-def _gabungkan_fallback_granular(df_now: pd.DataFrame, df_hist: pd.DataFrame, bobot_tahun: dict,
-                                  bulan_kolom: list,
-                                  key_cols: list = KUNCI_GRANULAR,
-                                  kelompok_cols: list = ("KDDEPT", "JENIS BELANJA", "_BUCKET_PAGU")
-                                  ) -> pd.DataFrame:
-    """Lengkapi tiap baris df_now (satker-jenis-akun tahun berjalan) dgn profil bulanan
-    & RATE_HIST/RP_* -- prioritas: profil satker itu sendiri -> profil kelompok satker
-    sejenis (KDDEPT+JENIS BELANJA+kelompok pagu) -> rata-rata nasional per JENIS BELANJA."""
-    df_now = df_now.copy()
-    df_now["_BUCKET_PAGU"] = _bucket_pagu(df_now["PAGU"])
-    df_hist = df_hist.copy()
-    df_hist["_BUCKET_PAGU"] = _bucket_pagu(df_hist["PAGU"])
-
-    kolom_rp = [f"RP_{b}" for b in bulan_kolom]
-    kolom_profil = list(bulan_kolom) + kolom_rp + ["RATE_HIST", "CV_RATE", "N_TAHUN"]
-
-    profil_own = _profil_granular(df_hist, key_cols, bobot_tahun, bulan_kolom).reset_index()
-    profil_grp = _profil_granular(df_hist, list(kelompok_cols), bobot_tahun, bulan_kolom).reset_index()
-    profil_glb = _profil_granular(df_hist, ["JENIS BELANJA"], bobot_tahun, bulan_kolom).reset_index()
-
-    basis = df_now.drop(columns=[c for c in bulan_kolom if c in df_now.columns])
-
-    m_own = basis.merge(profil_own, on=key_cols, how="left")
-    ada_sendiri = m_own["RATE_HIST"].notna() & (m_own["N_TAHUN"].fillna(0) > 0)
-
-    m_grp = basis.merge(profil_grp, on=list(kelompok_cols), how="left")
-    m_glb = basis.merge(profil_glb, on=["JENIS BELANJA"], how="left")
-
-    hasil = m_own.copy()
-    pakai_grp = (~ada_sendiri) & m_grp["RATE_HIST"].notna()
-    for c in kolom_profil:
-        hasil.loc[pakai_grp, c] = m_grp.loc[pakai_grp, c].values
-    pakai_glb = (~ada_sendiri) & (~pakai_grp)
-    for c in kolom_profil:
-        hasil.loc[pakai_glb, c] = m_glb.loc[pakai_glb, c].values
-
-    hasil["SUMBER_PROFIL"] = np.select(
-        [ada_sendiri, pakai_grp, pakai_glb],
-        ["Satker sendiri", "Kelompok sejenis (K/L+Jenis+Pagu)", "Rata-rata nasional per Jenis Belanja"],
-        default="Tidak ada profil",
-    )
-
-    tanpa_profil = hasil["RATE_HIST"].isna() & hasil[kolom_rp[0]].isna()
-    if tanpa_profil.any():
-        for b, c in zip(bulan_kolom, kolom_rp):
-            hasil.loc[tanpa_profil, b] = 1.0 / len(bulan_kolom)
-            hasil.loc[tanpa_profil, c] = 0.0
-        hasil.loc[tanpa_profil, "RATE_HIST"] = 1.0
-        hasil.loc[tanpa_profil, "CV_RATE"] = 2.0
-        hasil.loc[tanpa_profil, "N_TAHUN"] = 0
-        hasil.loc[tanpa_profil, "SUMBER_PROFIL"] = "Tidak ada histori sama sekali"
-
-    hasil["CV_RATE"] = hasil["CV_RATE"].fillna(0.0)
-
-    # Pengaman terakhir: kombinasi yang PAGU-nya ada tapi realisasi historisnya nol
-    # persis di semua tahun yang dipakai (mis. akun dialokasikan tapi tak pernah
-    # dibelanjakan) punya RATE_HIST valid (=0) tapi profil bentuk bulanan (0/0) jadi
-    # NaN -- isi dgn proporsi rata (1/12) & RP_* = 0 supaya tidak merembet jadi NaN
-    # di baseline forecast.
-    baris_share_kosong = hasil[bulan_kolom[0]].isna()
-    if baris_share_kosong.any():
-        for b, c in zip(bulan_kolom, kolom_rp):
-            hasil.loc[baris_share_kosong, b] = 1.0 / len(bulan_kolom)
-            hasil.loc[baris_share_kosong, c] = hasil.loc[baris_share_kosong, c].fillna(0.0)
-        hasil["RATE_HIST"] = hasil["RATE_HIST"].fillna(0.0)
-
-    return hasil
-
-
-def _baseline_forecast_granular(gabung: pd.DataFrame, bulan_kolom: list, kolom_kategori: str = None) -> np.ndarray:
-    """Hitung baseline forecast 12-bulan (rupiah, full tahun, BELUM direkonsiliasi dgn
-    realisasi aktual -- rekonsiliasi itu tugas isi_tabel_proyeksi) per baris granular,
-    lalu jumlahkan jadi satu vektor 12 -- utk dipakai hitung_proyeksi_agregat.
-
-    Belanja Pegawai (LABEL_BELANJA_PEGAWAI) pakai RP_<bulan> (rerata rupiah bulanan
-    historis langsung, TIDAK diskalakan pagu). Kategori lain pakai profil-share x
-    RATE_HIST x PAGU (baris) -- setara dgn tingkat serapan historis x pagu tahun ini,
-    disebar sesuai bentuk historis bulanan.
-    """
-    is_pegawai = gabung["JENIS BELANJA"] == 51  # kode jenis belanja Belanja Pegawai
-    baseline = np.zeros((len(gabung), len(bulan_kolom)))
-    for i, b in enumerate(bulan_kolom):
-        rp_pegawai = gabung[f"RP_{b}"].to_numpy()
-        non_pegawai = gabung[b].to_numpy() * gabung["RATE_HIST"].to_numpy() * gabung["PAGU"].to_numpy()
-        baseline[:, i] = np.where(is_pegawai.to_numpy(), rp_pegawai, non_pegawai)
-    return baseline
-
-
-def _agregasi_ke_kunci_granular(df: pd.DataFrame, key_cols: list = KUNCI_GRANULAR,
-                                 bulan_kolom: list = None) -> pd.DataFrame:
-    """Data sumber bisa punya lebih dari satu baris utk kombinasi (TAHUN + KDSATKER +
-    JENIS BELANJA + AKUN) yang sama (mis. beda program/kegiatan/sumber dana). Semua
-    fungsi proyeksi granular di bawah ini butuh 1 baris = 1 deret waktu per kombinasi
-    itu -- jadi dijumlahkan dulu di sini. Dipanggil otomatis di awal
-    hitung_proyeksi_agregat & hitung_proyeksi_per_kategori."""
-    bulan_kolom = bulan_kolom or BULAN_KOLOM
-    kolom_id = [c for c in ("NMSATKER", "KDDEPT", "NMDEPT", "PROVINSI", "LABEL_JENIS_BELANJA") if c in df.columns]
-    agg = {c: "sum" for c in list(bulan_kolom) + ["PAGU"]}
-    for c in kolom_id:
-        agg[c] = "first"
-    return df.groupby(["TAHUN"] + list(key_cols), as_index=False).agg(agg)
-
-
-def _hitung_proyeksi_agregat_nongranular(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
-    """Fallback -- metode lama (rate dihitung langsung di level scope filter_dict, tanpa
-    granularitas satker/akun). Dipakai OTOMATIS saat df_all tidak punya kolom granular
-    (KDSATKER/JENIS BELANJA/AKUN) -- mis. dataset kategori Prioritas Presiden/Program
-    Strategis di Halaman 2 & 3 yang skemanya beda dari dataset satker di Halaman 1."""
+def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
+    """Proyeksi 12 bulan (rupiah) untuk seluruh entitas terpilih. Return (array atau None, daftar tahun dipakai)."""
     total_rate = np.zeros(12)
     total_bobot = 0.0
     tahun_dipakai = []
@@ -506,67 +291,58 @@ def _hitung_proyeksi_agregat_nongranular(df_all: pd.DataFrame, tahun_y: int, pag
     return (total_rate / total_bobot) * pagu_y, tahun_dipakai
 
 
-def hitung_proyeksi_agregat(df_all: pd.DataFrame, tahun_y: int, pagu_y: float, filter_dict: dict):
-    """[GRANULAR, dgn fallback otomatis] Proyeksi 12 bulan (rupiah) utk seluruh entitas
-    terpilih.
+def _hitung_proyeksi_belanja_pegawai(
+    df_all: pd.DataFrame, tahun_y: int, filter_dict: dict, kolom_kategori: str, label,
+):
+    """Proyeksi 12 bulan KHUSUS Belanja Pegawai (jenis belanja 51).
 
-    Kalau df_all punya kolom granular lengkap (KDSATKER, JENIS BELANJA, AKUN) --
-    dipakai dataset satker Halaman 1/4 -- rate/profil dihitung per (KDSATKER, JENIS
-    BELANJA, AKUN) dulu (dgn fallback satker sejenis kalau perlu), baru dijumlahkan ke
-    scope filter_dict. Kalau TIDAK (mis. dataset kategori Halaman 2/3 yang skemanya
-    beda), otomatis pakai _hitung_proyeksi_agregat_nongranular (metode lama) supaya
-    fungsi ini tetap generik & tidak error pada skema data yang berbeda. Return (array
-    atau None, daftar tahun dipakai), signature & makna return SAMA seperti versi lama.
+    Beda dengan kategori lain: rumusnya rerata tertimbang dari REALISASI bulanan tahun-tahun
+    sebelumnya secara LANGSUNG (bukan tingkat realisasi (%) dikalikan pagu tahun berjalan):
+
+        proyeksi_bulan_m = (realisasi_bulan_m tahun y-1 * 50%) + (y-2 * 25%) + (y-3 * 12,5%)
+                            + (y-4 * 6,25%) + (y-5 * 6,25%)
+
+    Ini sengaja tidak diskalakan ke pagu tahun berjalan (pagu_y) supaya proyeksi belanja
+    pegawai boleh lebih besar dari pagu saat ini (mis. karena kenaikan gaji/tunjangan),
+    dan memang TIDAK dibatasi maksimal pagu -- lihat isi_tabel_proyeksi
+    (kategori_dikecualikan_cap). Kalau suatu tahun histori tidak ada datanya, bobot tahun itu
+    diabaikan & sisa bobot yang tersedia dinormalisasi (supaya tetap jadi rerata tertimbang),
+    sama seperti perlakuan kategori lain saat histori tidak lengkap.
     """
-    if not set(KUNCI_GRANULAR).issubset(df_all.columns):
-        return _hitung_proyeksi_agregat_nongranular(df_all, tahun_y, pagu_y, filter_dict)
-
-    df_all = _agregasi_ke_kunci_granular(df_all)
-    bobot_tahun = _bobot_per_tahun_absolut(tahun_y, BOBOT_TAHUN)
-    df_now = _filter_entitas(df_all, tahun_y, filter_dict)
-    if df_now.empty:
-        return None, []
-
-    tahun_hist_kandidat = sorted(bobot_tahun.keys())
-    df_hist = df_all[df_all["TAHUN"].isin(tahun_hist_kandidat)]
-    for kolom, nilai in filter_dict.items():
-        if nilai is not None:
-            df_hist = df_hist[df_hist[kolom] == nilai]
-    if df_hist.empty:
-        return None, []
-
-    tahun_dipakai = sorted(df_hist["TAHUN"].unique().tolist(), reverse=True)
-
-    gabung = _gabungkan_fallback_granular(df_now, df_hist, bobot_tahun, BULAN_KOLOM)
-    if (gabung["SUMBER_PROFIL"] == "Tidak ada histori sama sekali").all():
-        return None, []
-
-    baseline = _baseline_forecast_granular(gabung, BULAN_KOLOM)
-    return baseline.sum(axis=0), tahun_dipakai
+    total_weighted = np.zeros(12)
+    total_bobot = 0.0
+    tahun_dipakai = []
+    for i in range(1, 6):
+        d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
+        d_prev = d_prev[d_prev[kolom_kategori] == label]
+        if d_prev.empty:
+            continue
+        monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
+        total_weighted += BOBOT_TAHUN[i] * monthly_prev
+        total_bobot += BOBOT_TAHUN[i]
+        tahun_dipakai.append(tahun_y - i)
+    if total_bobot == 0:
+        return None, tahun_dipakai
+    return total_weighted / total_bobot, tahun_dipakai
 
 
-def _hitung_proyeksi_per_kategori_nongranular(df_all: pd.DataFrame, tahun_y: int,
-                                               pagu_per_kategori_now: pd.Series,
-                                               filter_dict: dict, kolom_kategori: str):
-    """Fallback -- metode lama, dipakai otomatis saat df_all tidak punya kolom granular
-    (lihat catatan di hitung_proyeksi_agregat/_hitung_proyeksi_agregat_nongranular)."""
+def hitung_proyeksi_per_kategori(
+    df_all: pd.DataFrame, tahun_y: int, pagu_per_kategori_now: pd.Series,
+    filter_dict: dict, kolom_kategori: str,
+):
+    """Proyeksi 12 bulan (rupiah) per kategori (jenis belanja ATAU jenis transfer).
+    Return dict label -> array(12) atau None (kalau tidak ada histori).
+
+    Kategori Belanja Pegawai (LABEL_BELANJA_PEGAWAI) pakai rumus berbeda -- lihat
+    _hitung_proyeksi_belanja_pegawai -- karena proyeksinya boleh melebihi pagu tahun berjalan."""
     hasil = {}
     tahun_dipakai_semua = set()
     for label, pagu_now in pagu_per_kategori_now.items():
         if kolom_kategori == "LABEL_JENIS_BELANJA" and label == LABEL_BELANJA_PEGAWAI:
-            total_weighted = np.zeros(12)
-            total_bobot = 0.0
-            tahun_dipakai_label = []
-            for i in range(1, 6):
-                d_prev = _filter_entitas(df_all, tahun_y - i, filter_dict)
-                d_prev = d_prev[d_prev[kolom_kategori] == label]
-                if d_prev.empty:
-                    continue
-                monthly_prev = d_prev[BULAN_KOLOM].sum().values.astype(float)
-                total_weighted += BOBOT_TAHUN[i] * monthly_prev
-                total_bobot += BOBOT_TAHUN[i]
-                tahun_dipakai_label.append(tahun_y - i)
-            hasil[label] = (total_weighted / total_bobot) if total_bobot > 0 else None
+            proyeksi_label, tahun_dipakai_label = _hitung_proyeksi_belanja_pegawai(
+                df_all, tahun_y, filter_dict, kolom_kategori, label
+            )
+            hasil[label] = proyeksi_label
             tahun_dipakai_semua.update(tahun_dipakai_label)
             continue
 
@@ -588,51 +364,9 @@ def _hitung_proyeksi_per_kategori_nongranular(df_all: pd.DataFrame, tahun_y: int
     return hasil, sorted(tahun_dipakai_semua, reverse=True)
 
 
-def hitung_proyeksi_per_kategori(df_all: pd.DataFrame, tahun_y: int, pagu_per_kategori_now: pd.Series,
-                                  filter_dict: dict, kolom_kategori: str):
-    """[GRANULAR, dgn fallback otomatis] Proyeksi 12 bulan (rupiah) per kategori. Return
-    (dict label->array(12) atau None, daftar tahun dipakai) -- signature & makna return
-    SAMA seperti versi lama. Fallback otomatis ke metode lama kalau df_all tidak punya
-    kolom granular (lihat catatan di hitung_proyeksi_agregat).
-    """
-    if not set(KUNCI_GRANULAR).issubset(df_all.columns):
-        return _hitung_proyeksi_per_kategori_nongranular(
-            df_all, tahun_y, pagu_per_kategori_now, filter_dict, kolom_kategori
-        )
-
-    hasil = {}
-    tahun_dipakai_semua = set()
-    df_all = _agregasi_ke_kunci_granular(df_all)
-    bobot_tahun = _bobot_per_tahun_absolut(tahun_y, BOBOT_TAHUN)
-    df_now = _filter_entitas(df_all, tahun_y, filter_dict)
-    tahun_hist_kandidat = sorted(bobot_tahun.keys())
-    df_hist_scope = df_all[df_all["TAHUN"].isin(tahun_hist_kandidat)]
-    for kolom, nilai in filter_dict.items():
-        if nilai is not None:
-            df_hist_scope = df_hist_scope[df_hist_scope[kolom] == nilai]
-
-    for label in pagu_per_kategori_now.index:
-        d_now = df_now[df_now[kolom_kategori] == label]
-        d_hist = df_hist_scope[df_hist_scope[kolom_kategori] == label]
-        if d_now.empty or d_hist.empty:
-            hasil[label] = None
-            continue
-        tahun_dipakai_semua.update(d_hist["TAHUN"].unique().tolist())
-
-        gabung = _gabungkan_fallback_granular(d_now, d_hist, bobot_tahun, BULAN_KOLOM)
-        if (gabung["SUMBER_PROFIL"] == "Tidak ada histori sama sekali").all():
-            hasil[label] = None
-            continue
-        baseline = _baseline_forecast_granular(gabung, BULAN_KOLOM)
-        hasil[label] = baseline.sum(axis=0)
-
-    return hasil, sorted(tahun_dipakai_semua, reverse=True)
-
-
 def isi_tabel_proyeksi(
     tabel_aktual: pd.DataFrame, proyeksi_per_kategori: dict, pagu_per_kategori: pd.Series,
     bulan_penuh_terakhir: int, kategori_dikecualikan_cap: str = LABEL_BELANJA_PEGAWAI,
-    kategori_rupiah_langsung: frozenset = frozenset({LABEL_BELANJA_PEGAWAI}),
 ) -> pd.DataFrame:
     """Isi bulan-bulan setelah bulan_penuh_terakhir dengan proyeksi (bukan double-count -- lihat
     catatan di app.py), lalu cap total (aktual+proyeksi) maksimal 100% pagu utk kategori selain
@@ -657,20 +391,6 @@ def isi_tabel_proyeksi(
                 # diproyeksikan tinggi, bukan disamaratakan.
                 bentuk_depan = proyeksi_kat[bulan_penuh_terakhir:]
                 target_tahun_penuh = proyeksi_kat.sum()
-
-                if kat in kategori_rupiah_langsung:
-                    # KHUSUS kategori rupiah-langsung (Belanja Pegawai): realisasi tahun
-                    # berjalan bisa saja sudah melebihi target historis (mis. karena pagu
-                    # tahun ini beda dari tahun-tahun sebelumnya, atau ada kenaikan gaji/
-                    # tunjangan). Di kondisi itu target dinaikkan ke proyeksi run-rate
-                    # (rata-rata realisasi bulan berjalan x 12) sbg lantai bawah -- TAPI
-                    # bentuk sebaran bulanannya tetap dari pola historis, bukan rata.
-                    # TIDAK diterapkan ke kategori lain krn realisasi tahunnya historis
-                    # jarang mendekati 100% pagu, jadi run-rate disini biasanya cuma bikin
-                    # proyeksi kebablasan ke atas (ke-cap 100% padahal seharusnya tidak).
-                    rerata_kat = actual_sum / bulan_penuh_terakhir if bulan_penuh_terakhir else 0
-                    target_runrate = rerata_kat * 12
-                    target_tahun_penuh = max(target_tahun_penuh, target_runrate)
 
             sisa_target = max(target_tahun_penuh - actual_sum, 0)
             total_bentuk_depan = bentuk_depan.sum()
@@ -704,62 +424,11 @@ def isi_tabel_proyeksi(
         # ini, "Total Realisasi + Proyeksi Akhir Tahun" bisa keliru tampil LEBIH KECIL dari
         # "Total Realisasi" murni -- yang secara logika tidak boleh terjadi.
         for kat in tabel_tampil.index:
-            m = bulan_penuh_terakhir  # HANYA bulan berjalan (yg baru sebagian), bukan seluruh sisa tahun
-            kol = BULAN_KOLOM[m]
-            asli = tabel_aktual.loc[kat, kol]
-            if pd.notna(asli) and asli > tabel_tampil.loc[kat, kol]:
-                tabel_tampil.loc[kat, kol] = asli
-
-    return tabel_tampil
-
-
-def sesuaikan_proyeksi_tukin_kemenhan(
-    df_scope: pd.DataFrame, tabel_tampil: pd.DataFrame, bulan_penuh_terakhir: int,
-) -> pd.DataFrame:
-    """Penyesuaian khusus proyeksi Belanja Pegawai utk Kementerian Pertahanan: mulai Juli
-    2026 ada kenaikan tunjangan kinerja (akun 512411) sebesar 28%/bulan, dirapel di
-    September utk Juli-Agustus yang sudah terlanjur direalisasikan sebelum kenaikan
-    berlaku. HANYA menyentuh bulan yang masih proyeksi (>= bulan_penuh_terakhir); tidak
-    pernah mengubah angka bulan yang sudah aktual/berakhir.
-
-    df_scope: data mentah pada cakupan (satker/kementerian/semua) yang sedang aktif di
-              dashboard -- fungsi ini otomatis menyaring baris Kemenhan (KDDEPT=12) dan
-              tidak melakukan apa-apa kalau Kemenhan tidak ada di cakupan ini.
-    """
-    if bulan_penuh_terakhir >= 12 or LABEL_BELANJA_PEGAWAI not in tabel_tampil.index:
-        return tabel_tampil
-
-    tukin = df_scope[
-        (df_scope["KDDEPT"] == KDDEPT_KEMENHAN)
-        & (df_scope["AKUN"].astype(str).str.strip().isin([a.strip() for a in AKUN_TUKIN_KEMENHAN]))
-    ]
-    if tukin.empty:
-        return tabel_tampil  # Kemenhan tidak ada di cakupan yang sedang dilihat
-
-    # Baseline bulanan = rata-rata realisasi AKTUAL akun tukin sebelum bulan kenaikan
-    # (Jan..Jun yang sudah benar-benar berakhir).
-    bulan_baseline = [
-        BULAN_KOLOM[i] for i in range(BULAN_MULAI_KENAIKAN_TUKIN - 1) if i < bulan_penuh_terakhir
-    ]
-    if not bulan_baseline:
-        return tabel_tampil  # belum cukup data aktual utk hitung baseline
-    baseline_bulanan = tukin[bulan_baseline].sum().sum() / len(bulan_baseline)
-    kenaikan_bulanan = baseline_bulanan * PERSEN_KENAIKAN_TUKIN
-
-    tabel_tampil = tabel_tampil.copy()
-    for m in range(bulan_penuh_terakhir, 12):
-        bulan_ke = m + 1
-        if bulan_ke >= BULAN_MULAI_KENAIKAN_TUKIN:
-            tabel_tampil.loc[LABEL_BELANJA_PEGAWAI, BULAN_KOLOM[m]] += kenaikan_bulanan
-        if bulan_ke == BULAN_RAPEL_TUKIN:
-            # Rapel utk bulan-bulan (Jul, Agst) yang SUDAH aktual (bukan proyeksi) sebelum
-            # kenaikan sempat tercermin di realisasi -- bulan yg masih proyeksi sendiri
-            # sudah otomatis dapat kenaikannya langsung dari baris di atas, tidak perlu rapel.
-            bulan_tertunda = [b for b in (7, 8) if b <= bulan_penuh_terakhir]
-            if bulan_tertunda:
-                tabel_tampil.loc[LABEL_BELANJA_PEGAWAI, BULAN_KOLOM[m]] += (
-                    kenaikan_bulanan * len(bulan_tertunda)
-                )
+            for m in range(bulan_penuh_terakhir, 12):
+                kol = BULAN_KOLOM[m]
+                asli = tabel_aktual.loc[kat, kol]
+                if pd.notna(asli) and asli > tabel_tampil.loc[kat, kol]:
+                    tabel_tampil.loc[kat, kol] = asli
 
     return tabel_tampil
 
@@ -1748,185 +1417,3 @@ def _render_chat_dataset_upload(ringkasan_fn, analisis_fn, page_key: str, daftar
         st.session_state[chat_state_key].append({"role": "assistant", "content": jawaban})
         with st.chat_message("assistant"):
             st.write(jawaban)
-
-
-# --------------------------------------------------------------------------
-# Confidence Score, Early Warning, Heatmap Deviasi & Waterfall -- FITUR BARU,
-# dibangun di atas mesin granular yang sama (fungsi di atas). Tidak menyentuh
-# fungsi lain -- aman ditambahkan tanpa mengubah perilaku halaman yang sudah ada.
-# --------------------------------------------------------------------------
-
-def hitung_detail_granular(df_all: pd.DataFrame, tahun_y: int, filter_dict: dict) -> pd.DataFrame:
-    """Detail hasil forecast per (KDSATKER, JENIS BELANJA, AKUN) utk cakupan filter_dict --
-    dipakai utk visual tambahan (confidence score, early warning, heatmap, waterfall).
-    Return DataFrame kosong kalau tidak ada data. Setiap baris = satu kombinasi granular,
-    dgn kolom PAGU, REALISASI_SD_INI, BASELINE_FORECAST_TOTAL, RATE_HIST, CV_RATE,
-    N_TAHUN, SUMBER_PROFIL, SKOR_KEPERCAYAAN.
-    """
-    df_all = _agregasi_ke_kunci_granular(df_all)
-    bobot_tahun = _bobot_per_tahun_absolut(tahun_y, BOBOT_TAHUN)
-    df_now = _filter_entitas(df_all, tahun_y, filter_dict)
-    if df_now.empty:
-        return pd.DataFrame()
-    df_hist = df_all[df_all["TAHUN"].isin(bobot_tahun.keys())]
-    for kolom, nilai in filter_dict.items():
-        if nilai is not None:
-            df_hist = df_hist[df_hist[kolom] == nilai]
-    if df_hist.empty:
-        return pd.DataFrame()
-
-    gabung = _gabungkan_fallback_granular(df_now, df_hist, bobot_tahun, BULAN_KOLOM)
-    baseline = _baseline_forecast_granular(gabung, BULAN_KOLOM)
-
-    _, bulan_penuh_terakhir = hitung_bulan_penuh_terakhir(df_now, tahun_y)
-    realisasi_sd_ini = df_now[BULAN_KOLOM[:bulan_penuh_terakhir]].sum(axis=1) if bulan_penuh_terakhir else pd.Series(0.0, index=df_now.index)
-
-    hasil = df_now[["KDSATKER", "NMSATKER", "KDDEPT", "NMDEPT", "JENIS BELANJA", "LABEL_JENIS_BELANJA", "AKUN", "PAGU"]].copy()
-    hasil["REALISASI_SD_INI"] = realisasi_sd_ini.values
-    hasil["BASELINE_FORECAST_TOTAL"] = baseline.sum(axis=1)
-    hasil["RATE_HIST"] = gabung["RATE_HIST"].values
-    hasil["CV_RATE"] = gabung["CV_RATE"].values
-    hasil["N_TAHUN"] = gabung["N_TAHUN"].values
-    hasil["SUMBER_PROFIL"] = gabung["SUMBER_PROFIL"].values
-
-    # Target akhir setelah rekonsiliasi sederhana (setara logika isi_tabel_proyeksi
-    # per baris granular): tidak boleh < realisasi yg sudah terjadi; utk kategori
-    # selain Pegawai, dibatasi maksimal pagu.
-    is_pegawai = hasil["JENIS BELANJA"] == 51
-    target = np.maximum(hasil["BASELINE_FORECAST_TOTAL"], hasil["REALISASI_SD_INI"])
-    target = np.where(is_pegawai, target, np.minimum(target, hasil["PAGU"]))
-    hasil["FORECAST_TOTAL"] = target
-
-    faktor_sumber = hasil["SUMBER_PROFIL"].map({
-        "Satker sendiri": 1.00, "Kelompok sejenis (K/L+Jenis+Pagu)": 0.70,
-        "Rata-rata nasional per Jenis Belanja": 0.50, "Tidak ada histori sama sekali": 0.20,
-    }).fillna(0.5)
-    faktor_n = np.clip(hasil["N_TAHUN"] / 3.0, 0.5, 1.0)
-    hasil["SKOR_KEPERCAYAAN"] = (100 * (1 / (1 + hasil["CV_RATE"].clip(lower=0))) * faktor_sumber * faktor_n).clip(0, 100).round(1)
-
-    hasil["_PROFIL_BULANAN"] = list(gabung[BULAN_KOLOM].to_numpy())  # dipakai heatmap
-    return hasil
-
-
-def deteksi_early_warning(df_all: pd.DataFrame, tahun_y: int, filter_dict: dict,
-                           ambang_deviasi_pp: float = 15.0, ambang_z: float = 1.5) -> pd.DataFrame:
-    """Early warning per kombinasi granular: forecast melebihi pagu, penyerapan
-    terlalu cepat/lambat dibanding pola historis bulan yang sama, lonjakan tak wajar
-    (z-score bulan terakhir vs histori), + skor risiko (0-100) & alasan.
-    """
-    detail = hitung_detail_granular(df_all, tahun_y, filter_dict)
-    if detail.empty:
-        return detail
-
-    _, bulan_penuh_terakhir = hitung_bulan_penuh_terakhir(_filter_entitas(df_all, tahun_y, filter_dict), tahun_y)
-    detail["RASIO_FORECAST_PAGU"] = np.where(detail["PAGU"] > 0, detail["FORECAST_TOTAL"] / detail["PAGU"], np.nan)
-    detail["FLAG_OVER_PAGU"] = detail["RASIO_FORECAST_PAGU"] > 1.001
-    detail["OVER_PAGU_INFO_SAJA"] = detail["FLAG_OVER_PAGU"] & (detail["JENIS BELANJA"] == 51)
-
-    df_agg = _agregasi_ke_kunci_granular(df_all)
-    bobot_tahun = _bobot_per_tahun_absolut(tahun_y, BOBOT_TAHUN)
-    df_hist = df_agg[df_agg["TAHUN"].isin(bobot_tahun.keys())]
-    for kolom, nilai in filter_dict.items():
-        if nilai is not None:
-            df_hist = df_hist[df_hist[kolom] == nilai]
-
-    key_cols = KUNCI_GRANULAR
-    if bulan_penuh_terakhir > 0:
-        dh = df_hist.copy()
-        dh["_KUM"] = dh[BULAN_KOLOM[:bulan_penuh_terakhir]].sum(axis=1)
-        dh["_PCT"] = np.where(dh["PAGU"] > 0, dh["_KUM"] / dh["PAGU"] * 100, np.nan)
-        dh["_BOBOT"] = dh["TAHUN"].map(bobot_tahun).fillna(0.0)
-        dhv = dh.dropna(subset=["_PCT"])
-        dhv = dhv[dhv["_BOBOT"] > 0].assign(_WPCT=lambda x: x["_PCT"] * x["_BOBOT"])
-        agg = dhv.groupby(key_cols).agg(_WPCT_SUM=("_WPCT", "sum"), _BOBOT_SUM=("_BOBOT", "sum"))
-        pct_hist = (agg["_WPCT_SUM"] / agg["_BOBOT_SUM"]).rename("PCT_KUM_HIST")
-        detail = detail.merge(pct_hist.reset_index(), on=key_cols, how="left")
-        detail["PCT_KUM_AKTUAL"] = np.where(detail["PAGU"] > 0, detail["REALISASI_SD_INI"] / detail["PAGU"] * 100, np.nan)
-        detail["DEVIASI_KECEPATAN_PP"] = (detail["PCT_KUM_AKTUAL"] - detail["PCT_KUM_HIST"]).fillna(0.0)
-
-        bulan_terakhir_kol = BULAN_KOLOM[bulan_penuh_terakhir - 1]
-        stat = df_hist.groupby(key_cols)[bulan_terakhir_kol].agg(_MEAN="mean", _STD="std").fillna(0)
-        detail = detail.merge(stat.reset_index(), on=key_cols, how="left")
-        df_now_bulan = _filter_entitas(df_all, tahun_y, filter_dict)
-        df_now_bulan = _agregasi_ke_kunci_granular(df_now_bulan)[key_cols + [bulan_terakhir_kol]]
-        detail = detail.merge(df_now_bulan, on=key_cols, how="left")
-        std_aman = detail["_STD"].replace(0, np.nan)
-        detail["Z_LONJAKAN"] = ((detail[bulan_terakhir_kol] - detail["_MEAN"]) / std_aman).fillna(0)
-        detail = detail.drop(columns=["_MEAN", "_STD", bulan_terakhir_kol])
-    else:
-        detail["DEVIASI_KECEPATAN_PP"] = 0.0
-        detail["Z_LONJAKAN"] = 0.0
-
-    detail["FLAG_TERLALU_CEPAT"] = detail["DEVIASI_KECEPATAN_PP"] > ambang_deviasi_pp
-    detail["FLAG_TERLALU_LAMBAT"] = detail["DEVIASI_KECEPATAN_PP"] < -ambang_deviasi_pp
-    detail["FLAG_LONJAKAN"] = detail["Z_LONJAKAN"] > ambang_z
-
-    komponen_over = np.clip((detail["RASIO_FORECAST_PAGU"].fillna(1) - 1) * 100, 0, 40) * (~detail["OVER_PAGU_INFO_SAJA"])
-    komponen_kecepatan = np.clip(detail["DEVIASI_KECEPATAN_PP"].abs() / 50 * 30, 0, 30)
-    komponen_lonjakan = np.clip(detail["Z_LONJAKAN"] / 4 * 30, 0, 30)
-    detail["SKOR_RISIKO"] = (komponen_over + komponen_kecepatan + komponen_lonjakan).clip(0, 100).round(1)
-
-    def _alasan(row):
-        a = []
-        if row["FLAG_OVER_PAGU"]:
-            a.append(("Forecast melebihi pagu (wajar, Belanja Pegawai)" if row["OVER_PAGU_INFO_SAJA"]
-                      else "Forecast melebihi pagu") + f" ({row['RASIO_FORECAST_PAGU']*100:.0f}% dari pagu)")
-        if row["FLAG_TERLALU_CEPAT"]:
-            a.append(f"Penyerapan lebih cepat {row['DEVIASI_KECEPATAN_PP']:.1f} pp dari pola historis bulan yang sama")
-        if row["FLAG_TERLALU_LAMBAT"]:
-            a.append(f"Penyerapan lebih lambat {abs(row['DEVIASI_KECEPATAN_PP']):.1f} pp dari pola historis bulan yang sama")
-        if row["FLAG_LONJAKAN"]:
-            a.append(f"Lonjakan realisasi tidak wajar bulan terakhir (z-score {row['Z_LONJAKAN']:.1f})")
-        return "; ".join(a) if a else "Tidak ada anomali terdeteksi"
-
-    detail["ALASAN_RISIKO"] = detail.apply(_alasan, axis=1)
-    return detail.drop(columns=["_PROFIL_BULANAN"], errors="ignore")
-
-
-def hitung_deviasi_heatmap(df_all: pd.DataFrame, tahun_y: int, filter_dict: dict) -> pd.DataFrame:
-    """Matrix deviasi realisasi aktual vs ekspektasi profil historis (%), per satker x
-    bulan, hanya utk bulan yang sudah aktual. Positif = lebih tinggi dari biasanya;
-    negatif = lebih rendah/tertinggal dari pola normal."""
-    detail = hitung_detail_granular(df_all, tahun_y, filter_dict)
-    if detail.empty:
-        return pd.DataFrame()
-    _, bulan_penuh_terakhir = hitung_bulan_penuh_terakhir(_filter_entitas(df_all, tahun_y, filter_dict), tahun_y)
-    if bulan_penuh_terakhir == 0:
-        return pd.DataFrame()
-
-    df_agg = _agregasi_ke_kunci_granular(df_all)
-    bobot_tahun = _bobot_per_tahun_absolut(tahun_y, BOBOT_TAHUN)
-    df_now = _filter_entitas(df_agg, tahun_y, filter_dict)
-    df_hist = df_agg[df_agg["TAHUN"].isin(bobot_tahun.keys())]
-    for kolom, nilai in filter_dict.items():
-        if nilai is not None:
-            df_hist = df_hist[df_hist[kolom] == nilai]
-    gabung = _gabungkan_fallback_granular(df_now, df_hist, bobot_tahun, BULAN_KOLOM)
-    gabung = gabung.merge(df_now[KUNCI_GRANULAR + ["NMSATKER", "PAGU"]], on=KUNCI_GRANULAR, how="left", suffixes=("", "_asli"))
-
-    pagu_grp = gabung.groupby("NMSATKER")["PAGU"].sum().replace(0, np.nan)
-    hasil_bulanan = {}
-    df_now_idx = df_now.set_index(KUNCI_GRANULAR)
-    for b in BULAN_KOLOM[:bulan_penuh_terakhir]:
-        aktual = df_now.groupby("NMSATKER")[b].sum()
-        ekspektasi = (gabung[b] * gabung["PAGU"]).groupby(gabung["NMSATKER"]).sum()
-        hasil_bulanan[BULAN_LABEL[BULAN_KOLOM.index(b) + 1]] = (aktual - ekspektasi) / pagu_grp * 100
-    return pd.DataFrame(hasil_bulanan)
-
-
-def ringkas_waterfall(df_all: pd.DataFrame, tahun_y: int, filter_dict: dict) -> dict:
-    """Ringkasan angka utk grafik waterfall Realisasi -> Forecast -> Total (vs Pagu)."""
-    detail = hitung_detail_granular(df_all, tahun_y, filter_dict)
-    if detail.empty:
-        return {"pagu": 0, "realisasi_sd_ini": 0, "forecast_sisa_tahun": 0, "forecast_total": 0,
-                "sisa_tak_terserap": 0, "kelebihan_dari_pagu": 0}
-    pagu = float(detail["PAGU"].sum())
-    realisasi = float(detail["REALISASI_SD_INI"].sum())
-    forecast_total = float(detail["FORECAST_TOTAL"].sum())
-    forecast_sisa = max(forecast_total - realisasi, 0.0)
-    return {
-        "pagu": pagu, "realisasi_sd_ini": realisasi, "forecast_sisa_tahun": forecast_sisa,
-        "forecast_total": forecast_total,
-        "sisa_tak_terserap": max(pagu - forecast_total, 0.0),
-        "kelebihan_dari_pagu": max(forecast_total - pagu, 0.0),
-    }
