@@ -8,6 +8,7 @@ Kode yang dipakai bersama halaman lain (loading data, login, proyeksi, dst) ada 
 common.py -- lihat file itu untuk detail implementasinya.
 """
 
+import forecast as fc
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -134,24 +135,15 @@ jenis_belanja = (
 # (lihat common.py::hitung_proyeksi_agregat utk rumus lengkap & penjelasan bobot)
 # --------------------------------------------------------------------------
 
-FILTER_ENTITAS = {"KDDEPT": kddept, "KDSATKER": kdsatker}
-
-proyeksi_agregat_bulanan, tahun_dipakai = hitung_proyeksi_agregat(df, tahun, pagu_total, FILTER_ENTITAS)
-
-if proyeksi_agregat_bulanan is None:
-    # Tidak ada histori sama sekali (mis. tahun pertama dalam data) -> fallback rata-rata bulan berjalan
-    rerata_bulanan = (kumulatif.iloc[bulan_terakhir - 1] / bulan_terakhir) if bulan_terakhir else 0
-    proyeksi_akhir_tahun = rerata_bulanan * 12
-    metode_proyeksi = "fallback"
-else:
-    # Target satu tahun penuh berdasarkan rerata tertimbang tingkat realisasi historis.
-    # Proyeksi akhir tahun = target itu, ATAU realisasi aktual sekarang kalau realisasi
-    # aktual sudah melebihi target itu sendiri (tidak mungkin proyeksi akhir tahun lebih
-    # kecil dari yang sudah benar-benar terealisasi).
-    target_tahun_penuh = proyeksi_agregat_bulanan.sum()
-    proyeksi_akhir_tahun = max(realisasi_total, target_tahun_penuh)
-    metode_proyeksi = "historis"
-
+# ---- FORECAST HYBRID BARU ----
+hasil_fc = fc.hitung_forecast(
+    df, tahun,
+    scope_satker=kdsatker,                                   # None bila semua satker
+    scope_dept=kddept if kdsatker is None else None,         # None bila semua K/L
+    kebijakan=fc.muat_kebijakan(),                           # dari CSV konfigurasi
+)
+proyeksi_akhir_tahun = hasil_fc.total_forecast
+metode_proyeksi = "hybrid"
 persen_proyeksi = (proyeksi_akhir_tahun / pagu_total * 100) if pagu_total else 0
 
 
@@ -239,38 +231,8 @@ bulan_angka = list(range(1, 13))
 # belum benar-benar berakhir (lihat bulan_penuh_terakhir) ditampilkan sebagai proyeksi (garis
 # putus-putus) memakai nilai proyeksi akhir bulan, BUKAN realisasi parsial yang sudah tercatat
 # sejauh ini -- walaupun datanya sudah tidak nol.
-def _nilai_proyeksi_bulan(b):
-    if proyeksi_agregat_bulanan is not None:
-        return proyeksi_agregat_bulanan[b - 1]
-    return rerata_bulanan
-
-
-aktual = [monthly.values[b - 1] if b <= bulan_penuh_terakhir else None for b in bulan_angka]
-proyeksi = []
-for b in bulan_angka:
-    if bulan_penuh_terakhir == 0:
-        # Belum ada satu bulan pun yang penuh datanya tahun ini -> seluruh garis adalah proyeksi
-        proyeksi.append(_nilai_proyeksi_bulan(b))
-    elif b < bulan_penuh_terakhir:
-        proyeksi.append(None)
-    elif b == bulan_penuh_terakhir:
-        proyeksi.append(monthly.values[b - 1])  # titik sambung dengan garis aktual
-    else:
-        proyeksi.append(_nilai_proyeksi_bulan(b))
-
-fig_trend = go.Figure()
-fig_trend.add_trace(go.Scatter(
-    x=BULAN_KOLOM, y=aktual, mode="lines+markers",
-    name="Realisasi per Bulan (Aktual)",
-    line=dict(width=3, shape="spline", smoothing=1.1),
-))
-fig_trend.add_trace(go.Scatter(
-    x=BULAN_KOLOM, y=proyeksi, mode="lines+markers",
-    name="Proyeksi (rata-rata bulanan)",
-    line=dict(dash="dash", shape="spline", smoothing=1.1),
-))
-fig_trend.update_layout(yaxis_title="Rupiah (per bulan)", xaxis_title=None)
-st.plotly_chart(fig_trend, use_container_width=True)
+st.subheader("Tren & Proyeksi Realisasi hingga Akhir Tahun")
+st.plotly_chart(fc.grafik_aktual_vs_forecast(hasil_fc), use_container_width=True)
 
 # --------------------------------------------------------------------------
 # Tabel realisasi per bulan per jenis belanja (aktual vs proyeksi), ditranspose:
@@ -314,24 +276,11 @@ realisasi_aktual_jenis = (
     .reindex(urutan_kode)
 )
 
-proyeksi_per_jenis, _ = hitung_proyeksi_per_kategori(
-    df, tahun, pagu_per_jenis.reindex(urutan_kode), FILTER_ENTITAS, "LABEL_JENIS_BELANJA"
-)
-
-# Data tampilan per bulan: realisasi aktual utk bulan yang sudah penuh, proyeksi utk bulan
-# yang belum berakhir/belum terjadi (memakai bulan_penuh_terakhir, sama seperti grafik tren).
-# Belanja Pegawai (51) pakai rumus proyeksi berbeda & TIDAK dibatasi maks pagu (lihat
-# common.py::_hitung_proyeksi_belanja_pegawai); jenis belanja lain otomatis dibatasi maks
-# 100% dari pagu -- lihat common.py::isi_tabel_proyeksi utk penjelasan lengkap cara hitungnya.
-tabel_tampil = isi_tabel_proyeksi(
-    realisasi_aktual_jenis, proyeksi_per_jenis, pagu_per_jenis, bulan_penuh_terakhir,
-    kategori_dikecualikan_cap=LABEL_BELANJA_PEGAWAI,
-)
-
-# Penyesuaian khusus: kenaikan tunjangan kinerja Kementerian Pertahanan 28%/bulan mulai
-# Juli, dirapel di September (lihat common.py::sesuaikan_proyeksi_tukin_kemenhan). Otomatis
-# tidak melakukan apa-apa kalau Kemenhan tidak ada di cakupan yang sedang dilihat.
-tabel_tampil = sesuaikan_proyeksi_tukin_kemenhan(df_satker, tabel_tampil, bulan_penuh_terakhir)
+# aktual per jenis (tidak berubah) tetap dari df_satker; tabel 12 bulan
+# (aktual + forecast, termasuk policy adjustment tukin) datang dari mesin baru:
+from common import LABEL_JENIS_BELANJA_SINGKAT
+tabel_tampil = fc.tabel_per_jenis(hasil_fc, label_map=LABEL_JENIS_BELANJA_SINGKAT)
+urutan_kode = tabel_tampil.index.tolist()   # urutan jenis belanja hasil forecast
 
 # --- Transpose: baris = bulan, kolom = jenis belanja, + kolom TOTAL di kanan ---
 tabel_t = tabel_tampil.reindex(urutan_kode).T
@@ -416,7 +365,9 @@ st.caption("🟨 Sel berwarna kuning = mengandung angka proyeksi (bulan yang bel
 
 st.divider()
 
-
+st.divider()
+fc.render_forecast_section(hasil_fc)   # KPI forecast, aktual-vs-forecast,
+                                       # waterfall, confidence, heatmap, early warning
 # --------------------------------------------------------------------------
 # Pencarian tematik lintas satker/kementerian/provinsi -- dipakai AI di chat box
 # untuk menjawab pertanyaan seperti "berapa pagu ketahanan pangan di Riau?" atau
